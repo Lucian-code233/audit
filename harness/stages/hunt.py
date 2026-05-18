@@ -1,0 +1,93 @@
+"""Stage 2: Hunt — concurrent single-attack-class hunters."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+
+from harness.runner import AgentRunError, run_agent
+from harness.state import StateDB, Task
+from harness.stages._common import StageContext, truncated_recon_summary
+
+log = logging.getLogger(__name__)
+
+
+async def run_hunt(ctx: StageContext, db: StateDB) -> int:
+    """Run all pending Hunt tasks concurrently. Returns the number of
+    findings emitted."""
+    pending = db.get_pending_tasks(ctx.run_id)
+    if not pending:
+        log.info("[%s] hunt: no pending tasks", ctx.run_id)
+        return 0
+
+    sc = ctx.stage("hunt")
+    recon_summary = db.get_recon_output(ctx.run_id) or {}
+    sem = asyncio.Semaphore(sc.concurrency)
+
+    log.info(
+        "[%s] hunt: dispatching %d tasks (concurrency=%d, model=%s)",
+        ctx.run_id, len(pending), sc.concurrency, sc.model,
+    )
+
+    counters = {"findings": 0, "tasks_done": 0, "tasks_failed": 0}
+
+    async def _one(task: Task) -> None:
+        async with sem:
+            db.update_task_status(task.task_id, "running")
+            scratch = ctx.work_dir("hunt", task.task_id)
+            subsystem_hint = task.target_files[0] if task.target_files else None
+            user_input = {
+                "task_id": task.task_id,
+                "attack_class": task.attack_class,
+                "scope_hint": task.scope_hint,
+                "target_files": task.target_files,
+                "rationale": task.rationale,
+                "repo_path": str(ctx.repo_path),
+                "scratch_dir": str(scratch),
+                "recon_summary": truncated_recon_summary(recon_summary, subsystem_hint),
+            }
+            try:
+                result = await run_agent(
+                    stage="hunt",
+                    prompt_file=ctx.prompt("02-hunt"),
+                    user_input=user_input,
+                    schema_file=ctx.schema("finding"),
+                    allowed_tools=sc.tools,
+                    model=sc.model,
+                    cwd=scratch,
+                    add_dirs=[ctx.repo_path],
+                    max_turns=sc.max_turns,
+                    permission_mode=sc.permission_mode,
+                    artifact_dir=ctx.results_dir("hunt"),
+                    artifact_name=task.task_id,
+                    repair_attempts=sc.repair_attempts,
+                )
+            except AgentRunError as e:
+                log.warning("[%s] hunt task %s failed: %s", ctx.run_id, task.task_id, e)
+                db.update_task_status(task.task_id, "failed")
+                counters["tasks_failed"] += 1
+                return
+
+            payload = result.payload
+            findings = payload.get("findings", []) or []
+            for f in findings:
+                db.add_finding(ctx.run_id, task.task_id, f)
+                counters["findings"] += 1
+            db.update_task_status(task.task_id, "done")
+            db.record_cost(ctx.run_id, "hunt", task.task_id, result.raw_result_message)
+            db.add_artifact(ctx.run_id, "hunt", task.task_id, "jsonl",
+                            str(result.artifact_path))
+            db.add_artifact(ctx.run_id, "hunt", task.task_id, "scratch_dir",
+                            str(scratch))
+            counters["tasks_done"] += 1
+            log.info(
+                "[%s] hunt %s: %d findings (cost=$%.4f)",
+                ctx.run_id, task.task_id, len(findings), result.cost_usd or 0.0,
+            )
+
+    await asyncio.gather(*(_one(t) for t in pending))
+    log.info(
+        "[%s] hunt: done=%d failed=%d findings=%d",
+        ctx.run_id, counters["tasks_done"], counters["tasks_failed"], counters["findings"],
+    )
+    return counters["findings"]
