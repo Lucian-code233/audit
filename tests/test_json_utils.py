@@ -1,10 +1,10 @@
-"""Tests for harness.json_utils.extract_json."""
+"""Tests for audit.json_utils.extract_json."""
 
 from __future__ import annotations
 
 import pytest
 
-from harness.json_utils import extract_json
+from audit.json_utils import extract_json
 
 
 def test_plain_json() -> None:

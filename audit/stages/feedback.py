@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import logging
 
-from harness.runner import AgentRunError, run_agent
-from harness.state import StateDB
-from harness.stages._common import StageContext, truncated_recon_summary
+from audit.runner import AgentRunError, run_agent
+from audit.state import StateDB
+from audit.stages._common import StageContext, truncated_recon_summary
 
 log = logging.getLogger(__name__)
 

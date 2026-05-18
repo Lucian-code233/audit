@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from harness import auth as auth_mod
-from harness.auth import AuthError, configure_auth
+from audit import auth as auth_mod
+from audit.auth import AuthError, configure_auth
 
 
 def test_missing_everything_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

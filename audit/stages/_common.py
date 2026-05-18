@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from harness.config import HarnessConfig, StageConfig
+from audit.config import HarnessConfig, StageConfig
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent

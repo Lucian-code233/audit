@@ -7,10 +7,10 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from harness import stages
-from harness.config import HarnessConfig
-from harness.state import StateDB
-from harness.stages._common import StageContext
+from audit import stages
+from audit.config import HarnessConfig
+from audit.state import StateDB
+from audit.stages._common import StageContext
 
 log = logging.getLogger(__name__)
 
@@ -35,6 +35,13 @@ async def run_pipeline(
         db.create_run(str(repo_path.resolve()), run_id)
         log.info("[%s] starting fresh pipeline run against %s", run_id, repo_path)
     elif resume:
+        # Flip status back to 'running' so subsequent /status calls don't
+        # report a stale 'aborted'/'failed' while resume work is ongoing.
+        db._conn.execute(  # type: ignore[attr-defined]
+            "UPDATE runs SET status = 'running', finished_at = NULL WHERE run_id = ?",
+            (run_id,),
+        )
+        db._conn.commit()  # type: ignore[attr-defined]
         log.info("[%s] resuming existing run", run_id)
     else:
         raise RuntimeError(
@@ -60,7 +67,7 @@ async def run_pipeline(
         # ---- Stages 2-3-4 loop: Hunt → Validate → Gapfill ----
         for i in range(config.gapfill_iterations + 1):
             _budget_check(f"hunt(iter={i})")
-            findings_added = await stages.run_hunt(ctx, db)
+            findings_added = await stages.run_hunt(ctx, db, budget_check=_budget_check)
             if findings_added == 0 and i > 0:
                 log.info("[%s] no new findings — exiting Hunt/Gapfill loop", run_id)
                 break

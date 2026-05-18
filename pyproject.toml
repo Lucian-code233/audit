@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "vuln-harness"
+name = "audit"
 version = "0.1.0"
-description = "Cloudflare-style 8-stage vulnerability discovery harness driven by Claude Code subscription auth"
+description = "Cloudflare-style 8-stage vulnerability discovery audit agent driven by Claude Code subscription auth"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -26,10 +26,10 @@ dev = [
 ]
 
 [project.scripts]
-vuln-harness = "harness.cli:main"
+audit = "audit.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["harness*"]
+include = ["audit*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

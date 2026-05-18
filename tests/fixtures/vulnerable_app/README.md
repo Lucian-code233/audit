@@ -10,8 +10,8 @@ Two-bug fixture for end-to-end pipeline testing:
 Smoke run:
 
 ```bash
-vuln-harness run --repo tests/fixtures/vulnerable_app --run-id smoke
-vuln-harness report --run-id smoke --format md
+audit run --repo tests/fixtures/vulnerable_app --run-id smoke
+audit report --run-id smoke --format md
 ```
 
 Expectation: at least 2 reachable findings.

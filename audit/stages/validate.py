@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from harness.runner import AgentRunError, run_agent
-from harness.state import Finding, StateDB
-from harness.stages._common import StageContext
+from audit.runner import AgentRunError, run_agent
+from audit.state import Finding, StateDB
+from audit.stages._common import StageContext
 
 log = logging.getLogger(__name__)
 

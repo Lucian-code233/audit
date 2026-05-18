@@ -26,7 +26,7 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
-from harness.json_utils import extract_json, validate_schema
+from audit.json_utils import extract_json, validate_schema
 
 
 @dataclass
@@ -77,6 +77,18 @@ async def run_agent(
     cwd.mkdir(parents=True, exist_ok=True)
 
     system_prompt = prompt_file.read_text()
+    # Append the literal schema body so the model never has to guess
+    # field names — this drastically reduces schema-validation failures
+    # on the first attempt and frees up the repair budget for real
+    # ambiguities.
+    schema_text = schema_file.read_text()
+    system_prompt += (
+        "\n\n# Output schema\n\n"
+        "Your output MUST validate against this JSON Schema. "
+        "Pay attention to nested objects, required fields, and "
+        "`additionalProperties: false`.\n\n"
+        f"```json\n{schema_text}\n```\n"
+    )
     options = ClaudeAgentOptions(
         system_prompt=system_prompt,
         allowed_tools=allowed_tools,

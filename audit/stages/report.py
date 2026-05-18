@@ -6,9 +6,9 @@ import json
 import logging
 from pathlib import Path
 
-from harness.runner import AgentRunError, run_agent
-from harness.state import StateDB
-from harness.stages._common import StageContext
+from audit.runner import AgentRunError, run_agent
+from audit.state import StateDB
+from audit.stages._common import StageContext
 
 log = logging.getLogger(__name__)
 

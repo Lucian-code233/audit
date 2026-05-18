@@ -1,4 +1,4 @@
-"""Tiny vulnerable Flask app — smoke target for the harness.
+"""Tiny vulnerable Flask app — smoke target for the audit agent.
 
 Two intentional bugs:
   - SQL injection at /lookup?name=...

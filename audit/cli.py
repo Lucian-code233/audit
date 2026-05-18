@@ -14,10 +14,10 @@ from rich.console import Console
 from rich.logging import RichHandler
 from rich.table import Table
 
-from harness.auth import AuthError, configure_auth
-from harness.config import load_config
-from harness.orchestrator import CostExceeded, run_pipeline
-from harness.state import StateDB
+from audit.auth import AuthError, configure_auth
+from audit.config import load_config
+from audit.orchestrator import CostExceeded, run_pipeline
+from audit.state import StateDB
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = REPO_ROOT / "state.db"
@@ -41,7 +41,7 @@ def _setup_logging(verbose: bool) -> None:
 @click.option("-v", "--verbose", is_flag=True, help="DEBUG logging.")
 @click.pass_context
 def main(ctx: click.Context, verbose: bool) -> None:
-    """vuln-harness — Cloudflare-style 8-stage vulnerability discovery."""
+    """audit — Cloudflare-style 8-stage vulnerability discovery agent."""
     ctx.ensure_object(dict)
     _setup_logging(verbose)
 

@@ -4,17 +4,23 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Awaitable, Callable
 
-from harness.runner import AgentRunError, run_agent
-from harness.state import StateDB, Task
-from harness.stages._common import StageContext, truncated_recon_summary
+from audit.runner import AgentRunError, run_agent
+from audit.state import StateDB, Task
+from audit.stages._common import StageContext, truncated_recon_summary
 
 log = logging.getLogger(__name__)
 
 
-async def run_hunt(ctx: StageContext, db: StateDB) -> int:
+async def run_hunt(
+    ctx: StageContext,
+    db: StateDB,
+    budget_check: Callable[[str], None] | None = None,
+) -> int:
     """Run all pending Hunt tasks concurrently. Returns the number of
-    findings emitted."""
+    findings emitted. If `budget_check` is provided, it is invoked
+    before each task and may raise to abort the stage early."""
     pending = db.get_pending_tasks(ctx.run_id)
     if not pending:
         log.info("[%s] hunt: no pending tasks", ctx.run_id)
@@ -23,16 +29,28 @@ async def run_hunt(ctx: StageContext, db: StateDB) -> int:
     sc = ctx.stage("hunt")
     recon_summary = db.get_recon_output(ctx.run_id) or {}
     sem = asyncio.Semaphore(sc.concurrency)
+    aborted = asyncio.Event()
 
     log.info(
         "[%s] hunt: dispatching %d tasks (concurrency=%d, model=%s)",
         ctx.run_id, len(pending), sc.concurrency, sc.model,
     )
 
-    counters = {"findings": 0, "tasks_done": 0, "tasks_failed": 0}
+    counters = {"findings": 0, "tasks_done": 0, "tasks_failed": 0, "skipped": 0}
 
     async def _one(task: Task) -> None:
         async with sem:
+            if aborted.is_set():
+                counters["skipped"] += 1
+                return
+            if budget_check is not None:
+                try:
+                    budget_check(f"hunt/{task.task_id}")
+                except Exception as e:
+                    log.warning("[%s] hunt aborting: %s", ctx.run_id, e)
+                    aborted.set()
+                    counters["skipped"] += 1
+                    return
             db.update_task_status(task.task_id, "running")
             scratch = ctx.work_dir("hunt", task.task_id)
             subsystem_hint = task.target_files[0] if task.target_files else None
@@ -87,7 +105,8 @@ async def run_hunt(ctx: StageContext, db: StateDB) -> int:
 
     await asyncio.gather(*(_one(t) for t in pending))
     log.info(
-        "[%s] hunt: done=%d failed=%d findings=%d",
-        ctx.run_id, counters["tasks_done"], counters["tasks_failed"], counters["findings"],
+        "[%s] hunt: done=%d failed=%d skipped=%d findings=%d",
+        ctx.run_id, counters["tasks_done"], counters["tasks_failed"],
+        counters["skipped"], counters["findings"],
     )
     return counters["findings"]

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from harness.config import load_config
+from audit.config import load_config
 
 
 def test_default_config_loads() -> None:

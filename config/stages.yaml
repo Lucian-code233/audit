@@ -13,6 +13,7 @@ stages:
     concurrency: 1
     tools: [Read, Grep, Glob, Bash]
     max_turns: 60                # recon can be long
+    repair_attempts: 2           # critical one-shot; spend a second repair turn if needed
   hunt:
     model: claude-sonnet-4-6
     concurrency: 50

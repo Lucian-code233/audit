@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from harness.state import StateDB
+from audit.state import StateDB
 
 
 def test_run_and_task_lifecycle(tmp_path: Path) -> None:
