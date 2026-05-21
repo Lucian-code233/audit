@@ -13,16 +13,29 @@ is:
   5. CLAUDE_CODE_OAUTH_TOKEN (long-lived subscription token)
   6. Subscription OAuth credentials from `claude login`
 
-This module supports three modes, picked in this order:
+This module supports four modes, picked in this order:
 
   - **gateway**: `ANTHROPIC_BASE_URL` points away from anthropic.com AND
     `ANTHROPIC_AUTH_TOKEN` is set. Used for OpenRouter and similar.
     We leave those two env vars intact but still scrub `ANTHROPIC_API_KEY`
     (it'd outrank the gateway token).
 
+  - **api_key**: `ANTHROPIC_API_KEY` is set with no gateway configured,
+    AND the caller passed `allow_api_key=True`. Metered Anthropic API
+    billing. We leave the key in place; the SDK uses it natively.
+    ANTHROPIC_AUTH_TOKEN is scrubbed so a stale value can't outrank
+    the key.
+
+    This mode is opt-in to protect users who set ANTHROPIC_API_KEY in
+    their shell for other tools (e.g. anthropic-sdk-python) but expect
+    subscription billing here. By default, the API key is scrubbed and
+    one of the subscription modes wins instead — matching the behavior
+    before this mode was added.
+
   - **oauth_token**: `CLAUDE_CODE_OAUTH_TOKEN` is set (Pro/Max/Team/Enterprise
-    subscription, ideal for CI). We scrub `ANTHROPIC_API_KEY` and
-    `ANTHROPIC_AUTH_TOKEN` so they can't outrank the OAuth token.
+    subscription, ideal for CI). We scrub `ANTHROPIC_API_KEY` (unless
+    api_key mode was selected above) and `ANTHROPIC_AUTH_TOKEN` so they
+    can't outrank the OAuth token.
 
   - **keychain_login**: `~/.claude/.credentials.json` exists from
     `claude login`. Same scrubbing as oauth_token.
@@ -43,7 +56,7 @@ from dotenv import load_dotenv
 
 @dataclass
 class AuthStatus:
-    auth_mode: str            # "gateway" | "oauth_token" | "keychain_login"
+    auth_mode: str            # "gateway" | "api_key" | "oauth_token" | "keychain_login"
     api_key_scrubbed: bool
     auth_token_scrubbed: bool
     claude_cli_path: str | None
@@ -70,8 +83,20 @@ def _is_gateway_base(url: str) -> bool:
     return "anthropic.com" not in u
 
 
-def configure_auth(env_file: Path | None = None) -> AuthStatus:
+def configure_auth(
+    env_file: Path | None = None,
+    *,
+    allow_api_key: bool = False,
+) -> AuthStatus:
     """Load .env, decide auth mode, scrub conflicting env vars accordingly.
+
+    Args:
+        env_file: Optional .env file to load before reading env vars.
+        allow_api_key: When True, ANTHROPIC_API_KEY is honored as a valid
+            auth path (api_key mode, metered billing). When False (default),
+            the key is scrubbed in favor of subscription auth — matching the
+            original "subscription only" behavior. Wire this from a CLI flag
+            or AUDIT_ALLOW_API_KEY=1 in the env.
 
     Returns an AuthStatus describing what was picked. Raises AuthError if
     no usable auth path is available.
@@ -93,20 +118,35 @@ def configure_auth(env_file: Path | None = None) -> AuthStatus:
     auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN", "").strip()
     gateway = _is_gateway_base(base_url) and bool(auth_token)
 
+    api_key_scrubbed = False
     auth_token_was_scrubbed = False
+    creds_file: Path | None = None
+
     if gateway:
         # Gateway path (OpenRouter / custom proxy / etc.): keep
         # ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN, but still drop
         # ANTHROPIC_API_KEY (rung 3 would outrank the gateway token).
         if api_key_was_set:
             del os.environ["ANTHROPIC_API_KEY"]
+            api_key_scrubbed = True
         mode = "gateway"
-        creds_file = None
+    elif allow_api_key and api_key_was_set:
+        # Explicit API key path (metered Anthropic billing). Leave the
+        # key in place; the SDK uses it natively at precedence rung 3.
+        # Scrub ANTHROPIC_AUTH_TOKEN so a stale value can't outrank the
+        # key (rung 2 > rung 3). No claude login credentials are needed.
+        if "ANTHROPIC_AUTH_TOKEN" in os.environ:
+            del os.environ["ANTHROPIC_AUTH_TOKEN"]
+            auth_token_was_scrubbed = True
+        mode = "api_key"
     else:
         # Subscription paths: scrub both API-key vars so subscription
-        # OAuth wins precedence.
+        # OAuth wins precedence. (When allow_api_key=False, this is the
+        # only place ANTHROPIC_API_KEY can land — and we always scrub it,
+        # matching the pre-opt-in behavior.)
         if api_key_was_set:
             del os.environ["ANTHROPIC_API_KEY"]
+            api_key_scrubbed = True
         if "ANTHROPIC_AUTH_TOKEN" in os.environ:
             del os.environ["ANTHROPIC_AUTH_TOKEN"]
             auth_token_was_scrubbed = True
@@ -118,13 +158,23 @@ def configure_auth(env_file: Path | None = None) -> AuthStatus:
         elif creds_file is not None:
             mode = "keychain_login"
         else:
+            hint = ""
+            if api_key_was_set:
+                hint = (
+                    "\n\nNote: ANTHROPIC_API_KEY was set but ignored. To use\n"
+                    "metered API billing, re-run with --allow-api-key (or set\n"
+                    "AUDIT_ALLOW_API_KEY=1 in the env)."
+                )
             raise AuthError(
                 "No auth available. Pick one of:\n"
                 "  (a) Subscription OAuth (interactive): run `claude login`.\n"
                 "  (b) Subscription OAuth (headless): run `claude setup-token` "
                 "and paste into .env as CLAUDE_CODE_OAUTH_TOKEN.\n"
                 "  (c) LLM gateway (OpenRouter / proxy): set "
-                "ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN."
+                "ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN.\n"
+                "  (d) Direct Anthropic API key (metered): set "
+                "ANTHROPIC_API_KEY and pass --allow-api-key."
+                + hint
             )
 
     cli_version: str | None = None
@@ -139,7 +189,7 @@ def configure_auth(env_file: Path | None = None) -> AuthStatus:
 
     return AuthStatus(
         auth_mode=mode,
-        api_key_scrubbed=api_key_was_set,
+        api_key_scrubbed=api_key_scrubbed,
         auth_token_scrubbed=auth_token_was_scrubbed,
         claude_cli_path=cli_path,
         claude_cli_version=cli_version,

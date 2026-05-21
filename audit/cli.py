@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sys
 import uuid
 from pathlib import Path
@@ -15,6 +16,14 @@ from rich.logging import RichHandler
 from rich.table import Table
 
 from audit.auth import AuthError, configure_auth
+
+
+def _allow_api_key_from_env_or_flag(flag: bool) -> bool:
+    """A user may opt into api_key mode via --allow-api-key OR via
+    AUDIT_ALLOW_API_KEY=1 in the env. Either is sufficient."""
+    if flag:
+        return True
+    return os.environ.get("AUDIT_ALLOW_API_KEY", "").strip() not in ("", "0", "false", "False")
 from audit.config import load_config
 from audit.orchestrator import CostExceeded, run_pipeline
 from audit.state import StateDB
@@ -47,15 +56,23 @@ def main(ctx: click.Context, verbose: bool) -> None:
 
 
 @main.command("auth-check")
-def auth_check() -> None:
-    """Verify Claude Code subscription auth is configured correctly."""
+@click.option("--allow-api-key", is_flag=True, default=False,
+              help="Honor ANTHROPIC_API_KEY for metered Anthropic billing "
+                   "(also via AUDIT_ALLOW_API_KEY=1).")
+def auth_check(allow_api_key: bool) -> None:
+    """Verify Claude Code auth is configured correctly."""
+    allow = _allow_api_key_from_env_or_flag(allow_api_key)
     try:
-        status = configure_auth()
+        status = configure_auth(allow_api_key=allow)
     except AuthError as e:
         console.print(f"[red]auth error:[/red] {e}")
         sys.exit(2)
     if status.auth_mode == "oauth_token":
         console.print("[green]OK[/green] using CLAUDE_CODE_OAUTH_TOKEN")
+    elif status.auth_mode == "api_key":
+        console.print(
+            "[green]OK[/green] using ANTHROPIC_API_KEY (metered Anthropic API billing)"
+        )
     elif status.auth_mode == "keychain_login":
         console.print(
             f"[green]OK[/green] using stored login from {status.credentials_file}"
@@ -101,14 +118,19 @@ def auth_check() -> None:
                    "rules / exclusions; passed verbatim to every stage.")
 @click.option("--config", "config_path", default=None, type=click.Path(),
               help="Override config/stages.yaml.")
+@click.option("--allow-api-key", is_flag=True, default=False,
+              help="Honor ANTHROPIC_API_KEY for metered Anthropic billing "
+                   "(also via AUDIT_ALLOW_API_KEY=1).")
 def run(repo: str, run_id: str | None, resume: bool, max_cost_usd: float | None,
         max_concurrency: int | None, max_recon_tasks: int | None,
         target_url: str | None, target_creds: tuple[str, ...],
         scope_notes_path: str | None,
-        config_path: str | None) -> None:
+        config_path: str | None,
+        allow_api_key: bool) -> None:
     """Run the full 8-stage pipeline against a target repo."""
+    allow = _allow_api_key_from_env_or_flag(allow_api_key)
     try:
-        configure_auth()
+        configure_auth(allow_api_key=allow)
     except AuthError as e:
         console.print(f"[red]auth error:[/red] {e}")
         sys.exit(2)
