@@ -1,6 +1,7 @@
-"""Auth setup tests — env scrubbing + the four auth modes.
+"""Auth setup tests — env scrubbing + the auth modes.
 
-Modes: gateway, api_key (opt-in), oauth_token, keychain_login.
+Modes: gateway, api_key (opt-in), oauth_token, keychain_login,
+macos_keychain_login.
 
 The api_key mode requires the caller to pass `allow_api_key=True` to
 configure_auth(). Without it, ANTHROPIC_API_KEY is scrubbed in favor of
@@ -40,12 +41,16 @@ def _clear_all_auth_env(monkeypatch: pytest.MonkeyPatch) -> None:
     ):
         monkeypatch.delenv(var, raising=False)
 
+def _force_non_macos(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force tests that expect no implicit local login fallback to run as Linux."""
+    monkeypatch.setattr(auth_mod.platform, "system", lambda: "Linux")
 
 # ---------- absence ----------
 
 
 def test_missing_everything_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _clear_all_auth_env(monkeypatch)
+    _force_non_macos(monkeypatch)
     monkeypatch.setattr(auth_mod, "CREDENTIALS_PATH", tmp_path / "no_creds.json")
     with pytest.raises(AuthError, match="No auth available"):
         configure_auth(env_file=_empty_env(tmp_path))
@@ -83,6 +88,7 @@ def test_default_scrubs_api_key_even_alone(
     """Default behavior: ANTHROPIC_API_KEY alone (no other auth, no opt-in)
     is scrubbed and yields AuthError with a hint about --allow-api-key."""
     _clear_all_auth_env(monkeypatch)
+    _force_non_macos(monkeypatch)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-should-be-deleted")
     monkeypatch.setattr(auth_mod, "CREDENTIALS_PATH", tmp_path / "no_creds.json")
     _require_claude_cli()
@@ -112,6 +118,20 @@ def test_keychain_mode(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     status = configure_auth(env_file=_empty_env(tmp_path))
     assert status.auth_mode == "keychain_login"
     assert status.credentials_file == creds
+
+def test_macos_keychain_login_mode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """On macOS, Claude Code /login credentials live in the macOS Keychain,
+    not in ~/.claude/.credentials.json. Allow this path through preflight so
+    the Claude Agent SDK can use the active first-party login."""
+    _clear_all_auth_env(monkeypatch)
+    monkeypatch.setattr(auth_mod, "CREDENTIALS_PATH", tmp_path / "no_creds.json")
+    monkeypatch.setattr(auth_mod.platform, "system", lambda: "Darwin")
+    _require_claude_cli()
+    status = configure_auth(env_file=_empty_env(tmp_path))
+    assert status.auth_mode == "macos_keychain_login"
+    assert status.credentials_file is None
 
 
 # ---------- opt-in api_key mode ----------
@@ -220,6 +240,7 @@ def test_gateway_mode_requires_both_url_and_token(
 ) -> None:
     """A base URL without a token doesn't trigger gateway mode."""
     _clear_all_auth_env(monkeypatch)
+    _force_non_macos(monkeypatch)
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://openrouter.ai/api")
     monkeypatch.setattr(auth_mod, "CREDENTIALS_PATH", tmp_path / "no_creds.json")
     _require_claude_cli()
