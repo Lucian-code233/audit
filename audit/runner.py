@@ -216,7 +216,17 @@ async def _run_agent_once(
         _write_artifact(art, {"kind": "meta", "stage": stage, "model": model, "started_at": time.time()})
         _write_artifact(art, {"kind": "user", "text": initial_prompt[:50000]})
 
-        async with ClaudeSDKClient(options=options) as client:
+        try:
+            sdk_ctx = ClaudeSDKClient(options=options)
+            client = await sdk_ctx.__aenter__()
+        except Exception as e:
+            if "timeout" in str(e).lower() or "initialize" in str(e).lower():
+                raise TransientAgentError(
+                    f"[{stage}/{artifact_name}] SDK initialize timeout: {e}"
+                ) from e
+            raise
+
+        try:
             await client.query(initial_prompt)
             last_text, last_result_msg = await _drain(client, art)
 
@@ -259,8 +269,10 @@ async def _run_agent_once(
                     f"{repair_attempts} repair attempts: {errors[:5]}"
                 )
 
-        payload = extract_json(last_text)
-        _write_artifact(art, {"kind": "final_payload", "payload": payload})
+            payload = extract_json(last_text)
+            _write_artifact(art, {"kind": "final_payload", "payload": payload})
+        finally:
+            await sdk_ctx.__aexit__(None, None, None)
 
     usage = last_result_msg.get("usage") or {}
     return AgentResult(

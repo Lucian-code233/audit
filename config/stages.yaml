@@ -26,6 +26,7 @@ stages:
     model: claude-sonnet-4-6
     concurrency: 1
     tools: [Read, Grep, Glob]
+    repair_attempts: 2
   dedupe:
     model: claude-sonnet-4-6
     concurrency: 1
@@ -38,6 +39,7 @@ stages:
     model: claude-sonnet-4-6
     concurrency: 1
     tools: [Read, Grep, Glob]
+    repair_attempts: 2
   report:
     model: claude-sonnet-4-6
     concurrency: 1

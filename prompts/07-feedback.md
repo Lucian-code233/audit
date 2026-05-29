@@ -61,6 +61,7 @@ prose.
 
 - All emitted tasks have `source: "feedback"` and `task_id` starting
   with `t_fb_`.
+- Set `priority` as an integer 1–5 (1 = highest), not a string.
 - Do not exceed `max_new_tasks`.
 - Skip tasks whose `target_files` are already covered in
   `reachable_traces`.

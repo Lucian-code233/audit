@@ -86,6 +86,11 @@ async def run_hunt(
                 db.update_task_status(task.task_id, "failed")
                 counters["tasks_failed"] += 1
                 return
+            except Exception as e:
+                log.error("[%s] hunt task %s unexpected error: %s", ctx.run_id, task.task_id, e)
+                db.update_task_status(task.task_id, "failed")
+                counters["tasks_failed"] += 1
+                return
 
             payload = result.payload
             findings = payload.get("findings", []) or []

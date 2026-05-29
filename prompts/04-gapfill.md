@@ -60,4 +60,5 @@ prose.
   class, concrete files, explicit trust boundary in `scope_hint`.
 - Each new task's `task_id` starts with `t_gf_` (gapfill source).
 - Set `source: "gapfill"` on each task.
+- Set `priority` as an integer 1–5 (1 = highest), not a string.
 - Output must validate against the schema. No prose.
