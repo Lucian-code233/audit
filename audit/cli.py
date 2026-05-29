@@ -77,6 +77,10 @@ def auth_check(allow_api_key: bool) -> None:
         console.print(
             f"[green]OK[/green] using stored login from {status.credentials_file}"
         )
+    elif status.auth_mode == "macos_keychain_login":
+        console.print(
+            "[green]OK[/green] using macOS Keychain-backed Claude Code login"
+        )
     elif status.auth_mode == "gateway":
         console.print(
             f"[green]OK[/green] using LLM gateway at {status.gateway_base_url} "

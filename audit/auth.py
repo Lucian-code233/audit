@@ -46,6 +46,7 @@ Anything else raises AuthError.
 from __future__ import annotations
 
 import os
+import platform
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -56,7 +57,7 @@ from dotenv import load_dotenv
 
 @dataclass
 class AuthStatus:
-    auth_mode: str            # "gateway" | "api_key" | "oauth_token" | "keychain_login"
+    auth_mode: str            # "gateway" | "api_key" | "oauth_token" | "keychain_login" | "macos_keychain_login"
     api_key_scrubbed: bool
     auth_token_scrubbed: bool
     claude_cli_path: str | None
@@ -157,6 +158,12 @@ def configure_auth(
             mode = "oauth_token"
         elif creds_file is not None:
             mode = "keychain_login"
+        elif platform.system() == "Darwin":
+            # Claude Code stores interactive /login credentials in the macOS
+            # Keychain, not in ~/.claude/.credentials.json. Do not reject this
+            # path during preflight; let Claude Code / the Agent SDK use the
+            # active Keychain-backed first-party login.
+            mode = "macos_keychain_login"
         else:
             hint = ""
             if api_key_was_set:
