@@ -252,6 +252,19 @@ class StateDB:
         )
         self._conn.commit()
 
+    def reset_incomplete_tasks(self, run_id: str) -> int:
+        """Flip 'running' and 'failed' tasks back to 'pending' so a resumed
+        run re-attempts work that was interrupted (quota/crash, left
+        'running') or that failed on a transient/quota error (marked
+        'failed'). Returns the number of tasks reset."""
+        cur = self._conn.execute(
+            "UPDATE tasks SET status = 'pending', updated_at = ? "
+            "WHERE run_id = ? AND status IN ('running', 'failed')",
+            (time.time(), run_id),
+        )
+        self._conn.commit()
+        return cur.rowcount
+
     @staticmethod
     def _row_to_task(r: sqlite3.Row) -> Task:
         return Task(

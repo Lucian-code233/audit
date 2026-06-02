@@ -16,6 +16,8 @@ from audit.runner import (
     "Usage limit reached for the day.",
     "Your plan has no remaining quota.",
     "YOU'RE OUT OF EXTRA USAGE.",
+    "You've hit your session limit · resets 5:10am (UTC)",
+    "You've hit your session limit · resets 11pm",
 ])
 def test_quota_classified(text: str) -> None:
     label, exc = _classify_api_error(text)

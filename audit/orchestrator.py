@@ -51,6 +51,13 @@ async def run_pipeline(
             (run_id,),
         )
         db._conn.commit()  # type: ignore[attr-defined]
+        # Re-queue any task left 'running' (interrupted mid-flight by a quota
+        # abort or crash) or 'failed' (transient/quota error) so resume
+        # actually re-attempts the incomplete work instead of skipping it —
+        # Hunt only dispatches 'pending' tasks.
+        requeued = db.reset_incomplete_tasks(run_id)
+        if requeued:
+            log.info("[%s] resume: re-queued %d interrupted/failed tasks", run_id, requeued)
         log.info("[%s] resuming existing run", run_id)
     else:
         raise RuntimeError(

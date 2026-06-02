@@ -34,6 +34,29 @@ def test_run_and_task_lifecycle(tmp_path: Path) -> None:
     db.close()
 
 
+def test_reset_incomplete_tasks(tmp_path: Path) -> None:
+    db = StateDB(tmp_path / "state.db")
+    rid = db.create_run("/some/repo", "test_run")
+    for tid, status in [("t_done", "done"), ("t_run", "running"),
+                        ("t_fail", "failed"), ("t_pend", "pending")]:
+        db.add_task(rid, {
+            "task_id": tid, "attack_class": "sqli", "scope_hint": "x",
+            "target_files": ["a.py"], "rationale": "r", "priority": 1,
+            "source": "recon",
+        })
+        db.update_task_status(tid, status)
+
+    n = db.reset_incomplete_tasks(rid)
+    assert n == 2  # only running + failed are re-queued
+    by_status = {t.task_id: t.status for t in db.get_all_tasks(rid)}
+    assert by_status == {
+        "t_done": "done", "t_run": "pending",
+        "t_fail": "pending", "t_pend": "pending",
+    }
+    assert {t.task_id for t in db.get_pending_tasks(rid)} == {"t_run", "t_fail", "t_pend"}
+    db.close()
+
+
 def test_finding_validation_and_dedupe(tmp_path: Path) -> None:
     db = StateDB(tmp_path / "state.db")
     rid = db.create_run("/some/repo", "test_run")
