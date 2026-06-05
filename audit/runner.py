@@ -204,6 +204,7 @@ async def _run_agent_once(
         cwd=str(cwd),
         add_dirs=[str(p) for p in (add_dirs or [])],
         permission_mode=permission_mode,
+        setting_sources=[],
     )
 
     initial_prompt = json.dumps(user_input, ensure_ascii=False)
