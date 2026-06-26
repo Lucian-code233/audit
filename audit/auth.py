@@ -1,44 +1,19 @@
-"""Auth setup for the Claude Code Agent SDK.
+"""Auth preflight for the cursor `agent` CLI.
 
-Claude Code's authentication-precedence list
-(https://code.claude.com/docs/en/authentication#authentication-precedence)
-is:
+Unlike the Claude Code SDK (which juggles ANTHROPIC_* env vars and OAuth
+precedence), the cursor agent has a simple auth surface:
 
-  1. Cloud provider credentials (Bedrock / Vertex / Foundry, when their
-     respective `CLAUDE_CODE_USE_*` flag is set)
-  2. ANTHROPIC_AUTH_TOKEN  (Bearer-token mode — used by LLM gateways
-     like OpenRouter, custom proxies, etc.)
-  3. ANTHROPIC_API_KEY      (the canonical metered Anthropic API)
-  4. apiKeyHelper
-  5. CLAUDE_CODE_OAUTH_TOKEN (long-lived subscription token)
-  6. Subscription OAuth credentials from `claude login`
+  - `CURSOR_API_KEY` / `CURSOR_AUTH_TOKEN` in the environment, or
+  - a stored interactive login from `agent login`.
 
-This module supports four modes, picked in this order:
+This module verifies the `agent` binary is on PATH and that *some* usable
+credential is present, then reports which mode was detected. It does no env
+scrubbing — there are no competing Anthropic vars to outrank.
 
-  - **gateway**: `ANTHROPIC_BASE_URL` points away from anthropic.com AND
-    `ANTHROPIC_AUTH_TOKEN` is set. Used for OpenRouter and similar.
-    We leave those two env vars intact but still scrub `ANTHROPIC_API_KEY`
-    (it'd outrank the gateway token).
-
-  - **api_key**: `ANTHROPIC_API_KEY` is set with no gateway configured,
-    AND the caller passed `allow_api_key=True`. Metered Anthropic API
-    billing. We leave the key in place; the SDK uses it natively.
-    ANTHROPIC_AUTH_TOKEN is scrubbed so a stale value can't outrank
-    the key.
-
-    This mode is opt-in to protect users who set ANTHROPIC_API_KEY in
-    their shell for other tools (e.g. anthropic-sdk-python) but expect
-    subscription billing here. By default, the API key is scrubbed and
-    one of the subscription modes wins instead — matching the behavior
-    before this mode was added.
-
-  - **oauth_token**: `CLAUDE_CODE_OAUTH_TOKEN` is set (Pro/Max/Team/Enterprise
-    subscription, ideal for CI). We scrub `ANTHROPIC_API_KEY` (unless
-    api_key mode was selected above) and `ANTHROPIC_AUTH_TOKEN` so they
-    can't outrank the OAuth token.
-
-  - **keychain_login**: `~/.claude/.credentials.json` exists from
-    `claude login`. Same scrubbing as oauth_token.
+Modes:
+  - **api_key**:  CURSOR_API_KEY / CURSOR_AUTH_TOKEN set in the env.
+  - **cli_login**: `agent status` reports an authenticated session (from
+    a prior `agent login`).
 
 Anything else raises AuthError.
 """
@@ -46,7 +21,6 @@ Anything else raises AuthError.
 from __future__ import annotations
 
 import os
-import platform
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -57,49 +31,50 @@ from dotenv import load_dotenv
 
 @dataclass
 class AuthStatus:
-    auth_mode: str            # "gateway" | "api_key" | "oauth_token" | "keychain_login" | "macos_keychain_login"
-    api_key_scrubbed: bool
-    auth_token_scrubbed: bool
-    claude_cli_path: str | None
-    claude_cli_version: str | None
-    credentials_file: Path | None
-    gateway_base_url: str | None
-    gateway_model: str | None  # value of ANTHROPIC_MODEL if set, for display
+    auth_mode: str            # "api_key" | "cli_login"
+    agent_cli_path: str | None
+    agent_cli_version: str | None
+    api_key_source: str | None  # "CURSOR_API_KEY" | "CURSOR_AUTH_TOKEN" | None
 
 
 class AuthError(RuntimeError):
     pass
 
 
-CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
+_API_KEY_VARS = ("CURSOR_API_KEY", "CURSOR_AUTH_TOKEN")
 
 
-def _is_gateway_base(url: str) -> bool:
-    """A non-empty BASE_URL that doesn't point at canonical Anthropic
-    counts as 'gateway mode'."""
-    u = url.strip().lower()
-    if not u:
+def _agent_status_ok(agent_path: str) -> bool:
+    """Return True if `agent status` reports an authenticated session."""
+    try:
+        out = subprocess.run(
+            [agent_path, "status"], capture_output=True, text=True, timeout=15
+        )
+    except (subprocess.SubprocessError, OSError):
         return False
-    # Treat anything except api.anthropic.com / console.anthropic.com as gateway.
-    return "anthropic.com" not in u
+    blob = f"{out.stdout}\n{out.stderr}".lower()
+    if out.returncode != 0:
+        return False
+    # `agent status` prints "Not logged in" when unauthenticated.
+    if "not logged in" in blob or "authentication required" in blob:
+        return False
+    return True
 
 
 def configure_auth(
     env_file: Path | None = None,
     *,
-    allow_api_key: bool = False,
+    allow_api_key: bool = True,
 ) -> AuthStatus:
-    """Load .env, decide auth mode, scrub conflicting env vars accordingly.
+    """Load .env, verify the cursor agent CLI + a usable credential.
 
     Args:
         env_file: Optional .env file to load before reading env vars.
-        allow_api_key: When True, ANTHROPIC_API_KEY is honored as a valid
-            auth path (api_key mode, metered billing). When False (default),
-            the key is scrubbed in favor of subscription auth — matching the
-            original "subscription only" behavior. Wire this from a CLI flag
-            or AUDIT_ALLOW_API_KEY=1 in the env.
+        allow_api_key: Accepted for CLI compatibility; cursor always honors
+            CURSOR_API_KEY, so this is effectively always-on (kept so the
+            existing --allow-api-key flag wiring doesn't break).
 
-    Returns an AuthStatus describing what was picked. Raises AuthError if
+    Returns an AuthStatus describing what was detected. Raises AuthError if
     no usable auth path is available.
     """
     if env_file is not None and env_file.exists():
@@ -107,82 +82,30 @@ def configure_auth(
     else:
         load_dotenv()
 
-    cli_path = shutil.which("claude")
+    cli_path = shutil.which("agent")
     if cli_path is None:
         raise AuthError(
-            "`claude` CLI not found on PATH. Install Claude Code first: "
-            "https://code.claude.com/docs/en/setup"
+            "`agent` (cursor) CLI not found on PATH. Install Cursor's CLI "
+            "first, then run `agent login`."
         )
 
-    api_key_was_set = "ANTHROPIC_API_KEY" in os.environ
-    base_url = os.environ.get("ANTHROPIC_BASE_URL", "")
-    auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN", "").strip()
-    gateway = _is_gateway_base(base_url) and bool(auth_token)
+    api_key_source: str | None = None
+    for var in _API_KEY_VARS:
+        if os.environ.get(var, "").strip():
+            api_key_source = var
+            break
 
-    api_key_scrubbed = False
-    auth_token_was_scrubbed = False
-    creds_file: Path | None = None
-
-    if gateway:
-        # Gateway path (OpenRouter / custom proxy / etc.): keep
-        # ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN, but still drop
-        # ANTHROPIC_API_KEY (rung 3 would outrank the gateway token).
-        if api_key_was_set:
-            del os.environ["ANTHROPIC_API_KEY"]
-            api_key_scrubbed = True
-        mode = "gateway"
-    elif allow_api_key and api_key_was_set:
-        # Explicit API key path (metered Anthropic billing). Leave the
-        # key in place; the SDK uses it natively at precedence rung 3.
-        # Scrub ANTHROPIC_AUTH_TOKEN so a stale value can't outrank the
-        # key (rung 2 > rung 3). No claude login credentials are needed.
-        if "ANTHROPIC_AUTH_TOKEN" in os.environ:
-            del os.environ["ANTHROPIC_AUTH_TOKEN"]
-            auth_token_was_scrubbed = True
+    if api_key_source is not None:
         mode = "api_key"
+    elif _agent_status_ok(cli_path):
+        mode = "cli_login"
     else:
-        # Subscription paths: scrub both API-key vars so subscription
-        # OAuth wins precedence. (When allow_api_key=False, this is the
-        # only place ANTHROPIC_API_KEY can land — and we always scrub it,
-        # matching the pre-opt-in behavior.)
-        if api_key_was_set:
-            del os.environ["ANTHROPIC_API_KEY"]
-            api_key_scrubbed = True
-        if "ANTHROPIC_AUTH_TOKEN" in os.environ:
-            del os.environ["ANTHROPIC_AUTH_TOKEN"]
-            auth_token_was_scrubbed = True
-
-        token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
-        creds_file = CREDENTIALS_PATH if CREDENTIALS_PATH.exists() else None
-        if token:
-            mode = "oauth_token"
-        elif creds_file is not None:
-            mode = "keychain_login"
-        elif platform.system() == "Darwin":
-            # Claude Code stores interactive /login credentials in the macOS
-            # Keychain, not in ~/.claude/.credentials.json. Do not reject this
-            # path during preflight; let Claude Code / the Agent SDK use the
-            # active Keychain-backed first-party login.
-            mode = "macos_keychain_login"
-        else:
-            hint = ""
-            if api_key_was_set:
-                hint = (
-                    "\n\nNote: ANTHROPIC_API_KEY was set but ignored. To use\n"
-                    "metered API billing, re-run with --allow-api-key (or set\n"
-                    "AUDIT_ALLOW_API_KEY=1 in the env)."
-                )
-            raise AuthError(
-                "No auth available. Pick one of:\n"
-                "  (a) Subscription OAuth (interactive): run `claude login`.\n"
-                "  (b) Subscription OAuth (headless): run `claude setup-token` "
-                "and paste into .env as CLAUDE_CODE_OAUTH_TOKEN.\n"
-                "  (c) LLM gateway (OpenRouter / proxy): set "
-                "ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN.\n"
-                "  (d) Direct Anthropic API key (metered): set "
-                "ANTHROPIC_API_KEY and pass --allow-api-key."
-                + hint
-            )
+        raise AuthError(
+            "No cursor auth available. Pick one of:\n"
+            "  (a) Interactive login: run `agent login`.\n"
+            "  (b) Headless: set CURSOR_API_KEY (or CURSOR_AUTH_TOKEN) in the "
+            "env or .env file."
+        )
 
     cli_version: str | None = None
     try:
@@ -196,11 +119,7 @@ def configure_auth(
 
     return AuthStatus(
         auth_mode=mode,
-        api_key_scrubbed=api_key_scrubbed,
-        auth_token_scrubbed=auth_token_was_scrubbed,
-        claude_cli_path=cli_path,
-        claude_cli_version=cli_version,
-        credentials_file=creds_file,
-        gateway_base_url=base_url if mode == "gateway" else None,
-        gateway_model=os.environ.get("ANTHROPIC_MODEL") if mode == "gateway" else None,
+        agent_cli_path=cli_path,
+        agent_cli_version=cli_version,
+        api_key_source=api_key_source,
     )

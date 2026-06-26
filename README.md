@@ -1,10 +1,11 @@
 # audit
 
-An 8-stage vulnerability-discovery agent, driven by your **Claude Pro / Max
-subscription** through the official Claude Code Agent SDK. Many narrow agents,
+An 8-stage vulnerability-discovery agent, driven by the local **cursor
+`agent` CLI** (Composer and other cursor-hosted models). Many narrow agents,
 deliberate disagreement, and an explicit reachability gate.
 
-MIT-licensed. No API key needed if you already use `claude login`.
+MIT-licensed. No Anthropic API key needed — auth comes from `agent login`
+or `CURSOR_API_KEY`.
 
 ## Origin
 
@@ -37,14 +38,14 @@ store, and orchestrator.
 
 | # | Stage    | Default model | Purpose |
 |---|----------|---------------|---------|
-| 1 | Recon    | Opus 4.7  | Map the repo, emit narrowly-scoped Hunt tasks |
-| 2 | Hunt     | Sonnet 4.6 | One attack class per agent; compile/run PoCs |
-| 3 | Validate | Opus 4.7  | Adversarial re-read; tries to **disprove** (different model from Hunt) |
-| 4 | Gapfill  | Sonnet 4.6 | Re-queue under-covered areas |
-| 5 | Dedupe   | Sonnet 4.6 | Cluster findings by root cause |
-| 6 | Trace    | Opus 4.7  | Prove attacker-controlled input reaches the sink |
-| 7 | Feedback | Sonnet 4.6 | Turn reachable traces into new Hunt tasks |
-| 8 | Report   | Sonnet 4.6 | Schema-validated structured report |
+| 1 | Recon    | composer-2.5  | Map the repo, emit narrowly-scoped Hunt tasks |
+| 2 | Hunt     | composer-2.5 | One attack class per agent; compile/run PoCs |
+| 3 | Validate | composer-2.5 | Adversarial re-read; tries to **disprove** Hunt's findings |
+| 4 | Gapfill  | composer-2.5 | Re-queue under-covered areas |
+| 5 | Dedupe   | composer-2.5 | Cluster findings by root cause |
+| 6 | Trace    | composer-2.5 | Prove attacker-controlled input reaches the sink |
+| 7 | Feedback | composer-2.5 | Turn reachable traces into new Hunt tasks |
+| 8 | Report   | composer-2.5 | Schema-validated structured report |
 
 Each stage is one markdown prompt in `prompts/` + one JSON Schema in
 `schemas/`. The orchestrator passes the schema into the system prompt so
@@ -53,15 +54,14 @@ every output is shape-stable on the first try.
 ## Quickstart
 
 ```bash
-# 1. Install
+# 1. Install (Python 3.11+)
 python -m venv .venv && source .venv/bin/activate
 pip install -e .
 
 # 2. Auth (pick one)
-#    (a) Already logged in via claude login? You're done.
-#    (b) Or generate a 1-year OAuth token for CI / non-interactive use:
-claude setup-token
-echo "CLAUDE_CODE_OAUTH_TOKEN=<paste>" > .env
+#    (a) Already logged in via `agent login`? You're done.
+#    (b) Or set an API key for CI / non-interactive use:
+echo "CURSOR_API_KEY=<paste>" > .env
 
 # 3. Verify
 audit auth-check
@@ -72,88 +72,52 @@ audit status --run-id my-run
 audit report --run-id my-run --format md > report.md
 ```
 
-By default the agent uses **subscription billing** via your Claude.ai
-login — it does **not** call the metered Anthropic API. The on-disk auth
-module scrubs `ANTHROPIC_API_KEY` from the environment so it can't
-silently route around the OAuth flow.
+The agent shells out to the local cursor `agent` binary in headless
+streaming mode (`agent --print --output-format stream-json`). It must be on
+your `PATH`; `audit auth-check` verifies both the binary and a usable
+credential.
 
-## Using a different model / provider
+## Using a different model
 
-The auth module picks one of three modes, in this order:
+Models are configured per-stage in `config/stages.yaml` as cursor model
+names. Run `agent --list-models` (while logged in) to see what your account
+can use. Examples: `composer-2.5`, `sonnet-4-thinking`, `gpt-5`, or
+parameterized forms like `claude-opus-4-8[context=1m,effort=high]`.
 
-1. **LLM gateway** (OpenRouter, custom proxy, etc.) — when
-   `ANTHROPIC_BASE_URL` points away from `anthropic.com` AND
-   `ANTHROPIC_AUTH_TOKEN` is set. The gateway env is left intact;
-   only `ANTHROPIC_API_KEY` is scrubbed (it would otherwise outrank the
-   gateway token).
-2. **Subscription OAuth (headless)** — `CLAUDE_CODE_OAUTH_TOKEN` from
-   `claude setup-token`. Best for CI.
-3. **Subscription OAuth (interactive)** — `~/.claude/.credentials.json`
-   from `claude login`. Best for local dev.
-
-### OpenRouter
-
-OpenRouter exposes Claude-compatible Anthropic-API endpoints behind its
-own credit system; that lets you spend OpenRouter credits instead of an
-Anthropic subscription, and gives you access to Sonnet/Opus *and* other
-models through the same SDK path. See [OpenRouter's Agent SDK guide](https://openrouter.ai/docs/guides/community/anthropic-agent-sdk).
-
-```bash
-export ANTHROPIC_BASE_URL="https://openrouter.ai/api"
-export ANTHROPIC_AUTH_TOKEN="$OPENROUTER_API_KEY"
-export ANTHROPIC_API_KEY=""           # must be explicitly empty / unset
-# optional: pick a non-Anthropic model
-export ANTHROPIC_MODEL="anthropic/claude-sonnet-4-6"
-# or e.g.: ANTHROPIC_MODEL="openai/gpt-5"
-#         ANTHROPIC_MODEL="google/gemini-2.5-pro"
-#         ANTHROPIC_MODEL="qwen/qwen3-coder-480b"
-
-audit auth-check                       # confirms "using LLM gateway at https://openrouter.ai/api"
-audit run --repo /path/to/target --run-id orun --max-cost-usd 30
-```
+The defaults run **every stage on `composer-2.5`**. Note this collapses the
+blog's Hunt-vs-Validate "deliberate disagreement" into a prompt-only check
+(Validate still adversarially re-reads, just on the same model). To restore
+model-level diversity, point Validate (and optionally Trace) at a different
+model your account exposes. Edit the YAML to change any stage's model.
 
 Caveats:
-- Per-stage model overrides in `config/stages.yaml` are model **names**
-  (e.g. `claude-opus-4-7`); OpenRouter accepts slash-prefixed forms like
-  `anthropic/claude-opus-4-7`. Edit the YAML if you want different
-  providers per stage. Otherwise `ANTHROPIC_MODEL` forces every stage
-  onto one model.
-- Non-Claude models may not produce schema-compliant JSON as reliably.
-  The runner's schema-validation + repair turn still applies; quality
-  varies by model.
-- Tool-use semantics (Read/Grep/Glob/Bash) are part of the Claude Code
-  CLI, not the model — they work as long as the gateway speaks the
-  Anthropic Messages API.
-
-### Other gateways / cloud providers
-
-Same recipe — anything that exposes the Anthropic Messages API at a URL
-+ a bearer token works:
-
-```bash
-export ANTHROPIC_BASE_URL="https://your-proxy.example.com"
-export ANTHROPIC_AUTH_TOKEN="$YOUR_TOKEN"
-unset ANTHROPIC_API_KEY
-```
-
-For Amazon Bedrock / Google Vertex / Microsoft Foundry, Claude Code has
-first-class env-var flags (`CLAUDE_CODE_USE_BEDROCK=1` etc.) that
-outrank everything else. See the [Claude Code auth docs](https://code.claude.com/docs/en/authentication).
+- `tools:` in `stages.yaml` only matters for the presence of `Bash`. A
+  stage whose tools include `Bash` runs the cursor agent in `--yolo` (full
+  shell access); a stage without `Bash` runs in `--mode plan` (read-only).
+  cursor has no finer-grained per-tool allowlist, so `Read`/`Grep`/`Glob`
+  are advisory hints, not enforced limits.
+- Non-Claude / non-Composer models may not produce schema-compliant JSON
+  as reliably. The runner's schema-validation + repair turn still applies;
+  quality varies by model.
+- The cursor CLI returns no per-run cost, so `--max-cost-usd` is ignored
+  (see Cost containment).
 
 ## Cost containment
 
 A real production codebase can produce 15-50 Hunt tasks and 25+ findings to
-validate. At default concurrency this gets expensive. Flags to keep it sane:
+validate. At default concurrency this gets expensive. The cursor CLI does
+**not** report a per-run dollar cost, so the `--max-cost-usd` budget guard
+is disabled (the flag is accepted but ignored). Contain cost with the
+structural caps instead:
 
 ```bash
 audit run --repo /path/to/target \
-  --max-concurrency 1 \           # one claude subprocess at a time
-  --max-recon-tasks 15 \          # cap initial Hunt fanout
-  --max-cost-usd 30               # abort cleanly if exceeded
+  --max-concurrency 1 \           # one cursor subprocess at a time
+  --max-recon-tasks 15            # cap initial Hunt fanout
 ```
 
-The budget guard fires between *and* within stages — a per-task check in
-Hunt cooperatively aborts rather than running 30 more tasks past the cap.
+`--max-concurrency 1` is the biggest lever — it serializes every stage so
+at most one `agent` process runs at a time.
 
 ## Live-target reproduction (optional)
 
@@ -165,7 +129,7 @@ remains available — these flags are opt-in.
 
 ```bash
 audit run --repo /path/to/target --run-id live \
-  --max-concurrency 1 --max-cost-usd 30 \
+  --max-concurrency 1 \
   --target-url http://server.local:8888 \
   --target-creds email=admin@system.com \
   --target-creds password=changechangeme
@@ -218,13 +182,13 @@ chain. This is the one allowed exception to single-attack-class scoping.
 ## Layout
 
 ```
-prompts/        8 stage prompts (markdown, loaded as system prompts)
+prompts/        8 stage prompts (markdown, prepended to the agent prompt)
 schemas/        9 JSON schemas — every agent output is validated
-config/         stages.yaml — model + concurrency + tool allowlist per stage
+config/         stages.yaml — model + concurrency + tool mode per stage
 audit/          Python package
-  auth.py       OAuth check + ANTHROPIC_API_KEY scrubbing
+  auth.py       cursor `agent` CLI preflight (binary + credential check)
   state.py      SQLite DAO (runs, tasks, findings, traces, dedupe, costs)
-  runner.py     claude-agent-sdk wrapper with schema validation + repair turn
+  runner.py     cursor-CLI driver: stream-json parse + schema validation + repair turn
   orchestrator.py pipeline driver
   stages/       one module per stage
 work/           per-Hunt-task scratch dirs (sandbox for PoC compile/run)
@@ -234,14 +198,18 @@ state.db        SQLite (gitignored)
 
 ## Safety
 
-Hunt agents have Bash and run inside per-task scratch dirs. They are **not**
-sandboxed at the OS level. Run the audit inside a disposable VM or container
-when you don't trust the target source — a target with malicious build
-scripts could otherwise execute on your host during PoC compilation.
+Hunt agents run with `--yolo` (full shell access) inside per-task scratch
+dirs. They are **not** sandboxed at the OS level. Run the audit inside a
+disposable VM or container when you don't trust the target source — a
+target with malicious build scripts could otherwise execute on your host
+during PoC compilation. (`--yolo` is the cursor equivalent of running every
+tool call without approval; there is no narrower per-tool gate, so treat
+shell-capable stages as fully trusted-to-execute.)
 
-The agent reads everything you `--add-dir`, including any `.env` or
-`secrets/` directories in the target. Outputs land in `results/<run-id>/`
-which is `.gitignore`d but **not** scrubbed of those reads.
+The agent reads the target repo (passed via `--workspace` and named in the
+prompt), including any `.env` or `secrets/` directories in it. Outputs land
+in `results/<run-id>/` which is `.gitignore`d but **not** scrubbed of those
+reads.
 
 ## License
 
@@ -251,4 +219,4 @@ which is `.gitignore`d but **not** scrubbed of those reads.
 
 - The pipeline design is from Cloudflare's [Project Glasswing](https://blog.cloudflare.com/cyber-frontier-models/)
   blog post. The credit for the architecture goes there.
-- Built on the official [Claude Code Agent SDK](https://code.claude.com/docs/en/agent-sdk/overview).
+- Driven by the [cursor agent CLI](https://cursor.com/).

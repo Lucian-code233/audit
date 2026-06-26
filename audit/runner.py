@@ -1,15 +1,26 @@
-"""Run one agent: open a ClaudeSDKClient session, send a JSON input,
-parse + schema-validate the final JSON output, and persist a JSONL
-artifact of every message exchanged.
+"""Run one agent via the cursor `agent` CLI, send a JSON input, parse +
+schema-validate the final JSON output, and persist a JSONL artifact of
+every message exchanged.
 
-Always uses ClaudeSDKClient (not query()) so that a schema-validation
-failure can be followed up with a repair turn inside the same session.
+Drives the cursor binary in headless streaming mode:
 
-API-error handling: the Claude CLI surfaces 529 Overloaded and
-subscription-quota-exhausted errors as `ResultMessage(is_error=True)` with
-the error text in place of a real assistant response. We detect this
-BEFORE schema validation, classify the error, and either retry with
-exponential backoff (transient) or raise QuotaExhaustedError (terminal).
+    agent --print --output-format stream-json --model <m> \
+          --workspace <cwd> [--yolo | --mode plan] --trust "<prompt>"
+
+The CLI emits one JSON object per line on stdout. We consume that stream,
+re-serialize each message into our own self-describing `.jsonl` artifact
+format (meta/user/assistant/thinking/tool_use/tool_result/result), and
+pull the final assistant text out for schema validation.
+
+A schema-validation failure is followed up with a repair turn. Because the
+cursor CLI is one-shot per process, the repair turn resumes the same chat
+session via `--resume <session_id>` so the model keeps its context.
+
+API-error handling: the cursor CLI surfaces overloaded / quota-exhausted
+errors either as a `result` line with `is_error=true` or as a non-zero
+process exit. We detect this BEFORE schema validation, classify the error,
+and either retry with exponential backoff (transient) or raise
+QuotaExhaustedError (terminal).
 """
 
 from __future__ import annotations
@@ -18,25 +29,21 @@ import asyncio
 import dataclasses
 import json
 import logging
+import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from claude_agent_sdk import (
-    AssistantMessage,
-    ClaudeAgentOptions,
-    ClaudeSDKClient,
-    ResultMessage,
-    TextBlock,
-    ThinkingBlock,
-    ToolResultBlock,
-    ToolUseBlock,
-)
-
 from audit.json_utils import extract_json, validate_schema
 
 log = logging.getLogger(__name__)
+
+# Tools that imply the agent needs to run shell commands. Stages whose
+# allowed_tools include "Bash" run in --yolo (full access); analysis-only
+# stages run in --mode plan (read-only). This is the closest cursor maps
+# to the SDK's per-tool allowlist.
+_SHELL_TOOLS = {"Bash"}
 
 
 @dataclass
@@ -61,13 +68,13 @@ class AgentRunError(RuntimeError):
 
 
 class TransientAgentError(RuntimeError):
-    """API returned a transient error (529 Overloaded, generic 5xx).
+    """API returned a transient error (overloaded, generic 5xx).
     The agent call should be retried with backoff."""
 
 
 class QuotaExhaustedError(RuntimeError):
-    """The Claude subscription has run out of quota. Don't retry — abort
-    the pipeline and let the user wait for the reset window."""
+    """The subscription has run out of quota. Don't retry — abort the
+    pipeline and let the user wait for the reset window."""
 
 
 _QUOTA_MARKERS = (
@@ -166,6 +173,50 @@ async def run_agent(
     raise last_exc
 
 
+def _build_system_prompt(prompt_file: Path, schema_file: Path) -> str:
+    """The stage prompt with the literal output schema appended, so the
+    model never has to guess field names. cursor has no --system-prompt
+    flag, so this is prepended to the user prompt instead."""
+    system_prompt = prompt_file.read_text()
+    schema_text = schema_file.read_text()
+    system_prompt += (
+        "\n\n# Output schema\n\n"
+        "Your output MUST validate against this JSON Schema. "
+        "Pay attention to nested objects, required fields, and "
+        "`additionalProperties: false`.\n\n"
+        f"```json\n{schema_text}\n```\n"
+    )
+    return system_prompt
+
+
+def _cursor_cmd(
+    *,
+    model: str,
+    cwd: Path,
+    allowed_tools: list[str],
+    resume_session: str | None,
+) -> list[str]:
+    """Assemble the cursor CLI argv (minus the trailing prompt)."""
+    agent_bin = shutil.which("agent") or "agent"
+    cmd = [
+        agent_bin,
+        "--print",
+        "--output-format", "stream-json",
+        "--model", model,
+        "--workspace", str(cwd),
+        "--trust",
+    ]
+    # Per-tool allowlist has no cursor equivalent. Map shell-capable stages
+    # to --yolo (full access); analysis-only stages to --mode plan (read-only).
+    if _SHELL_TOOLS.intersection(allowed_tools):
+        cmd.append("--yolo")
+    else:
+        cmd += ["--mode", "plan"]
+    if resume_session:
+        cmd += ["--resume", resume_session]
+    return cmd
+
+
 async def _run_agent_once(
     *,
     stage: str,
@@ -183,102 +234,95 @@ async def _run_agent_once(
     repair_attempts: int,
 ) -> AgentResult:
     """Single attempt. Raises TransientAgentError / QuotaExhaustedError
-    before schema validation if the API returned is_error=True."""
+    before schema validation if the CLI returned an error result."""
     artifact_dir.mkdir(parents=True, exist_ok=True)
     artifact_path = artifact_dir / f"{artifact_name}.jsonl"
     cwd.mkdir(parents=True, exist_ok=True)
 
-    system_prompt = prompt_file.read_text()
-    # Append the literal schema body so the model never has to guess
-    # field names — this drastically reduces schema-validation failures
-    # on the first attempt and frees up the repair budget for real
-    # ambiguities.
-    schema_text = schema_file.read_text()
-    system_prompt += (
-        "\n\n# Output schema\n\n"
-        "Your output MUST validate against this JSON Schema. "
-        "Pay attention to nested objects, required fields, and "
-        "`additionalProperties: false`.\n\n"
-        f"```json\n{schema_text}\n```\n"
+    system_prompt = _build_system_prompt(prompt_file, schema_file)
+    # The agent's cwd is --workspace; any extra readable roots (e.g. the
+    # target repo when running inside a scratch dir) are named in the
+    # prompt so the agent can reach them by absolute path under --yolo.
+    add_dir_note = ""
+    if add_dirs:
+        roots = ", ".join(str(p) for p in add_dirs)
+        add_dir_note = (
+            f"\n\n# Accessible paths\n\nYou may read these absolute paths "
+            f"in addition to your workspace: {roots}\n"
+        )
+    initial_prompt = (
+        system_prompt + add_dir_note
+        + "\n\n# Task input\n\n```json\n"
+        + json.dumps(user_input, ensure_ascii=False)
+        + "\n```\n"
     )
-    options = ClaudeAgentOptions(
-        system_prompt=system_prompt,
-        allowed_tools=allowed_tools,
-        model=model,
-        max_turns=max_turns,
-        cwd=str(cwd),
-        add_dirs=[str(p) for p in (add_dirs or [])],
-        permission_mode=permission_mode,
-        setting_sources=[],
-    )
-
-    initial_prompt = json.dumps(user_input, ensure_ascii=False)
 
     last_text = ""
     last_result_msg: dict[str, Any] = {}
+    session_id: str | None = None
     repair_used = False
 
     with artifact_path.open("w") as art:
         _write_artifact(art, {"kind": "meta", "stage": stage, "model": model, "started_at": time.time()})
         _write_artifact(art, {"kind": "user", "text": initial_prompt[:50000]})
 
-        try:
-            sdk_ctx = ClaudeSDKClient(options=options)
-            client = await sdk_ctx.__aenter__()
-        except Exception as e:
-            if "timeout" in str(e).lower() or "initialize" in str(e).lower():
-                raise TransientAgentError(
-                    f"[{stage}/{artifact_name}] SDK initialize timeout: {e}"
-                ) from e
-            raise
+        last_text, last_result_msg, session_id = await _run_cursor(
+            stage=stage,
+            artifact_name=artifact_name,
+            cmd=_cursor_cmd(model=model, cwd=cwd, allowed_tools=allowed_tools,
+                            resume_session=None),
+            prompt=initial_prompt,
+            art=art,
+        )
 
-        try:
-            await client.query(initial_prompt)
-            last_text, last_result_msg = await _drain(client, art)
+        # Before schema validation: was this a real model response, or did
+        # the CLI surface an API error in the result line?
+        if last_result_msg.get("is_error"):
+            label, exc_cls = _classify_api_error(last_text)
+            _write_artifact(art, {"kind": "api_error", "classification": label,
+                                  "text": last_text[:1000]})
+            raise exc_cls(
+                f"[{stage}/{artifact_name}] {label}: "
+                f"{(last_text or '').strip()[:300]}"
+            )
 
-            # Before schema validation: was this a real model response, or
-            # did the CLI surface an API error as the assistant text?
+        attempts = 0
+        errors = _validate(last_text, schema_file)
+        while errors and attempts < repair_attempts:
+            attempts += 1
+            repair_used = True
+            repair_prompt = _build_repair_prompt(last_text, errors, schema_file)
+            _write_artifact(art, {"kind": "repair_request", "text": repair_prompt[:50000]})
+            # Resume the same chat so the model keeps its context. If we never
+            # got a session_id back, fall back to a stateless repair prompt.
+            last_text, last_result_msg, session_id = await _run_cursor(
+                stage=stage,
+                artifact_name=artifact_name,
+                cmd=_cursor_cmd(model=model, cwd=cwd, allowed_tools=allowed_tools,
+                                resume_session=session_id),
+                prompt=repair_prompt,
+                art=art,
+            )
             if last_result_msg.get("is_error"):
                 label, exc_cls = _classify_api_error(last_text)
-                _write_artifact(art, {"kind": "api_error", "classification": label,
+                _write_artifact(art, {"kind": "api_error_on_repair",
+                                      "classification": label,
                                       "text": last_text[:1000]})
                 raise exc_cls(
-                    f"[{stage}/{artifact_name}] {label}: "
+                    f"[{stage}/{artifact_name}] {label} on repair turn: "
                     f"{(last_text or '').strip()[:300]}"
                 )
-
-            attempts = 0
             errors = _validate(last_text, schema_file)
-            while errors and attempts < repair_attempts:
-                attempts += 1
-                repair_used = True
-                repair_prompt = _build_repair_prompt(last_text, errors, schema_file)
-                _write_artifact(art, {"kind": "repair_request", "text": repair_prompt[:50000]})
-                await client.query(repair_prompt)
-                last_text, last_result_msg = await _drain(client, art)
-                # An API error on the repair turn is also retry-worthy.
-                if last_result_msg.get("is_error"):
-                    label, exc_cls = _classify_api_error(last_text)
-                    _write_artifact(art, {"kind": "api_error_on_repair",
-                                          "classification": label,
-                                          "text": last_text[:1000]})
-                    raise exc_cls(
-                        f"[{stage}/{artifact_name}] {label} on repair turn: "
-                        f"{(last_text or '').strip()[:300]}"
-                    )
-                errors = _validate(last_text, schema_file)
 
-            if errors:
-                _write_artifact(art, {"kind": "schema_errors", "errors": errors})
-                raise AgentRunError(
-                    f"[{stage}/{artifact_name}] schema validation failed after "
-                    f"{repair_attempts} repair attempts: {errors[:5]}"
-                )
+        if errors:
+            _write_artifact(art, {"kind": "schema_errors", "errors": errors})
+            raise AgentRunError(
+                f"[{stage}/{artifact_name}] schema validation failed after "
+                f"{repair_attempts} repair attempts: {errors[:5]}"
+            )
 
-            payload = extract_json(last_text)
-            _write_artifact(art, {"kind": "final_payload", "payload": payload})
-        finally:
-            await sdk_ctx.__aexit__(None, None, None)
+        payload = extract_json(last_text)
+        _write_artifact(art, {"kind": "final_payload", "payload": payload})
 
     usage = last_result_msg.get("usage") or {}
     return AgentResult(
@@ -290,36 +334,203 @@ async def _run_agent_once(
         cache_creation_tokens=usage.get("cache_creation_input_tokens"),
         num_turns=last_result_msg.get("num_turns"),
         duration_ms=last_result_msg.get("duration_ms"),
-        session_id=last_result_msg.get("session_id"),
+        session_id=last_result_msg.get("session_id") or session_id,
         artifact_path=artifact_path,
         repair_used=repair_used,
         raw_result_message=last_result_msg,
     )
 
 
-async def _drain(client: ClaudeSDKClient, art) -> tuple[str, dict[str, Any]]:
-    """Consume the response stream, write each message to the JSONL
-    artifact, and return (concatenated assistant text from last
-    assistant message, result_message_dict)."""
-    text_chunks: list[str] = []
+async def _run_cursor(
+    *,
+    stage: str,
+    artifact_name: str,
+    cmd: list[str],
+    prompt: str,
+    art,
+) -> tuple[str, dict[str, Any], str | None]:
+    """Spawn the cursor CLI, stream-parse stdout, write each message to the
+    JSONL artifact, and return (final assistant text, result_dict, session_id).
+
+    Raises TransientAgentError if the process can't be started or dies
+    without producing a result line (treated as retry-worthy)."""
+    full_cmd = [*cmd, prompt]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *full_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except (OSError, ValueError) as e:
+        raise TransientAgentError(
+            f"[{stage}/{artifact_name}] failed to spawn cursor agent: {e}"
+        ) from e
+
+    last_assistant_text = ""
+    thinking_buf: list[str] = []
     result_msg: dict[str, Any] = {}
-    last_assistant_text: list[str] = []
+    session_id: str | None = None
+    saw_result = False
 
-    async for msg in client.receive_response():
-        _write_artifact(art, _serialize_message(msg))
-        if isinstance(msg, AssistantMessage):
-            last_assistant_text = []
-            for block in msg.content:
-                if isinstance(block, TextBlock):
-                    last_assistant_text.append(block.text)
-            text_chunks.append("".join(last_assistant_text))
-        elif isinstance(msg, ResultMessage):
-            result_msg = _result_to_dict(msg)
+    assert proc.stdout is not None
+    async for raw in proc.stdout:
+        line = raw.decode("utf-8", "replace").strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            # Non-JSON noise on stdout (e.g. an auth/usage error printed
+            # outside the stream). Capture it so the error classifier and
+            # artifact have something to work with.
+            _write_artifact(art, {"kind": "stdout_nonjson", "text": line[:2000]})
+            if not result_msg:
+                result_msg = {"is_error": True, "result": line}
+                saw_result = True
+            continue
 
-    final_text = "".join(last_assistant_text) if last_assistant_text else (
-        text_chunks[-1] if text_chunks else ""
-    )
-    return final_text, result_msg
+        norm = _normalize_cursor_msg(obj)
+        if norm is not None:
+            _write_artifact(art, norm)
+
+        sid = obj.get("session_id")
+        if sid:
+            session_id = sid
+
+        mtype = obj.get("type")
+        if mtype == "thinking" and obj.get("subtype") == "delta":
+            thinking_buf.append(obj.get("text", ""))
+        elif mtype == "assistant":
+            text = _assistant_text(obj)
+            if text:
+                last_assistant_text = text
+        elif mtype == "result":
+            result_msg = _result_to_dict(obj)
+            saw_result = True
+
+    stderr_bytes = await proc.stderr.read() if proc.stderr else b""
+    await proc.wait()
+    stderr_text = stderr_bytes.decode("utf-8", "replace").strip()
+
+    if not saw_result:
+        # No result line at all → treat the process exit + stderr as the
+        # error surface, classified downstream.
+        msg = stderr_text or f"cursor agent exited {proc.returncode} with no result"
+        _write_artifact(art, {"kind": "no_result", "returncode": proc.returncode,
+                              "stderr": stderr_text[:2000]})
+        result_msg = {"is_error": True, "result": msg}
+        return msg, result_msg, session_id
+
+    # Prefer the result line's full text (== final assistant message);
+    # fall back to the last streamed assistant block.
+    final_text = result_msg.get("result") or last_assistant_text
+    return final_text, result_msg, session_id
+
+
+def _assistant_text(obj: dict[str, Any]) -> str:
+    """Concatenate text blocks from a cursor `assistant` message."""
+    content = (obj.get("message") or {}).get("content") or []
+    parts = [b.get("text", "") for b in content
+             if isinstance(b, dict) and b.get("type") == "text"]
+    return "".join(parts)
+
+
+def _normalize_cursor_msg(obj: dict[str, Any]) -> dict[str, Any] | None:
+    """Map a raw cursor stream-json line to our self-describing artifact
+    format. Returns None for lines we don't persist verbatim (thinking
+    deltas are buffered and not individually written)."""
+    mtype = obj.get("type")
+    sub = obj.get("subtype")
+
+    if mtype == "system" and sub == "init":
+        return {"kind": "system_init", "model": obj.get("model"),
+                "cwd": obj.get("cwd"), "permission_mode": obj.get("permissionMode")}
+    if mtype == "thinking":
+        if sub == "completed":
+            return {"kind": "thinking_completed"}
+        return None  # deltas buffered, not written per-line
+    if mtype == "assistant":
+        return {"kind": "assistant", "content": [{"type": "text",
+                "text": _assistant_text(obj)}]}
+    if mtype == "tool_call":
+        return _normalize_tool_call(obj)
+    if mtype == "result":
+        return {"kind": "result", **_result_to_dict(obj)}
+    # Pass through anything else (e.g. "user" echo) with a generic kind.
+    if mtype == "user":
+        return {"kind": "user_echo"}
+    return {"kind": f"cursor_{mtype}", "subtype": sub}
+
+
+def _normalize_tool_call(obj: dict[str, Any]) -> dict[str, Any]:
+    """Map cursor tool_call/{started,completed} → tool_use / tool_result.
+
+    cursor nests the call under tool_call.<kind>ToolCall (e.g.
+    shellToolCall, readToolCall). We extract a name, the input args, and —
+    on completion — the result with an is_error flag."""
+    sub = obj.get("subtype")
+    call_id = obj.get("call_id")
+    tc = obj.get("tool_call") or {}
+    # tool_call holds exactly one *ToolCall key (shellToolCall, readToolCall…)
+    inner_key = next((k for k in tc if k.endswith("ToolCall")), None)
+    inner = tc.get(inner_key) or {} if inner_key else {}
+    name = inner_key[:-len("ToolCall")] if inner_key else "tool"
+
+    if sub == "started":
+        return {
+            "kind": "tool_use",
+            "id": call_id,
+            "name": name,
+            "input": inner.get("args") or {},
+        }
+    # completed → tool_result
+    result = inner.get("result") or tc.get("result") or {}
+    success = result.get("success") if isinstance(result, dict) else None
+    is_error = True
+    content: Any = result
+    if isinstance(success, dict):
+        is_error = success.get("exitCode", 0) not in (0, None)
+        content = success.get("stdout", "") or success.get("output", "")
+        stderr = success.get("stderr")
+        if stderr:
+            content = f"{content}\n[stderr]\n{stderr}" if content else stderr
+    elif result == {} or result is None:
+        is_error = False
+        content = ""
+    return {
+        "kind": "tool_result",
+        "tool_use_id": call_id,
+        "name": name,
+        "content": content,
+        "is_error": is_error,
+    }
+
+
+def _result_to_dict(obj: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a cursor `result` line into the shape the rest of the
+    harness expects. cursor uses camelCase token names and provides no
+    cost / num_turns / stop_reason — those are set to None."""
+    raw_usage = obj.get("usage") or {}
+    usage = {
+        "input_tokens": raw_usage.get("inputTokens"),
+        "output_tokens": raw_usage.get("outputTokens"),
+        "cache_read_input_tokens": raw_usage.get("cacheReadTokens"),
+        "cache_creation_input_tokens": raw_usage.get("cacheWriteTokens"),
+    }
+    return {
+        "subtype": obj.get("subtype"),
+        "is_error": bool(obj.get("is_error")),
+        "duration_ms": obj.get("duration_ms"),
+        "duration_api_ms": obj.get("duration_api_ms"),
+        "num_turns": None,
+        "session_id": obj.get("session_id"),
+        "stop_reason": None,
+        "total_cost_usd": None,
+        "usage": usage,
+        "result": obj.get("result"),
+        "request_id": obj.get("request_id"),
+        "model_usage": None,
+    }
 
 
 def _validate(text: str, schema_file: Path) -> list[str]:
@@ -352,53 +563,3 @@ def _json_fallback(o: Any) -> Any:
     if isinstance(o, Path):
         return str(o)
     return repr(o)
-
-
-def _serialize_message(msg: Any) -> dict[str, Any]:
-    if isinstance(msg, AssistantMessage):
-        return {
-            "kind": "assistant",
-            "model": msg.model,
-            "usage": msg.usage,
-            "content": [_serialize_block(b) for b in msg.content],
-        }
-    if isinstance(msg, ResultMessage):
-        return {"kind": "result", **_result_to_dict(msg)}
-    if dataclasses.is_dataclass(msg):
-        return {"kind": type(msg).__name__, **dataclasses.asdict(msg)}
-    return {"kind": type(msg).__name__, "repr": repr(msg)}
-
-
-def _serialize_block(b: Any) -> dict[str, Any]:
-    if isinstance(b, TextBlock):
-        return {"type": "text", "text": b.text}
-    if isinstance(b, ThinkingBlock):
-        return {"type": "thinking", "thinking": b.thinking}
-    if isinstance(b, ToolUseBlock):
-        return {"type": "tool_use", "id": b.id, "name": b.name, "input": b.input}
-    if isinstance(b, ToolResultBlock):
-        return {
-            "type": "tool_result",
-            "tool_use_id": b.tool_use_id,
-            "content": b.content,
-            "is_error": b.is_error,
-        }
-    if dataclasses.is_dataclass(b):
-        return dataclasses.asdict(b)
-    return {"type": type(b).__name__, "repr": repr(b)}
-
-
-def _result_to_dict(msg: ResultMessage) -> dict[str, Any]:
-    return {
-        "subtype": msg.subtype,
-        "is_error": msg.is_error,
-        "duration_ms": msg.duration_ms,
-        "duration_api_ms": msg.duration_api_ms,
-        "num_turns": msg.num_turns,
-        "session_id": msg.session_id,
-        "stop_reason": msg.stop_reason,
-        "total_cost_usd": msg.total_cost_usd,
-        "usage": msg.usage,
-        "result": msg.result,
-        "model_usage": msg.model_usage,
-    }

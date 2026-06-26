@@ -57,44 +57,23 @@ def main(ctx: click.Context, verbose: bool) -> None:
 
 @main.command("auth-check")
 @click.option("--allow-api-key", is_flag=True, default=False,
-              help="Honor ANTHROPIC_API_KEY for metered Anthropic billing "
-                   "(also via AUDIT_ALLOW_API_KEY=1).")
+              help="(Deprecated no-op on the cursor backend; the cursor "
+                   "agent always honors CURSOR_API_KEY.)")
 def auth_check(allow_api_key: bool) -> None:
-    """Verify Claude Code auth is configured correctly."""
+    """Verify the cursor `agent` CLI auth is configured correctly."""
     allow = _allow_api_key_from_env_or_flag(allow_api_key)
     try:
         status = configure_auth(allow_api_key=allow)
     except AuthError as e:
         console.print(f"[red]auth error:[/red] {e}")
         sys.exit(2)
-    if status.auth_mode == "oauth_token":
-        console.print("[green]OK[/green] using CLAUDE_CODE_OAUTH_TOKEN")
-    elif status.auth_mode == "api_key":
+    if status.auth_mode == "api_key":
         console.print(
-            "[green]OK[/green] using ANTHROPIC_API_KEY (metered Anthropic API billing)"
+            f"[green]OK[/green] using {status.api_key_source} (cursor API key)"
         )
-    elif status.auth_mode == "keychain_login":
-        console.print(
-            f"[green]OK[/green] using stored login from {status.credentials_file}"
-        )
-    elif status.auth_mode == "macos_keychain_login":
-        console.print(
-            "[green]OK[/green] using macOS Keychain-backed Claude Code login"
-        )
-    elif status.auth_mode == "gateway":
-        console.print(
-            f"[green]OK[/green] using LLM gateway at {status.gateway_base_url} "
-            "(ANTHROPIC_AUTH_TOKEN)"
-        )
-        if status.gateway_model:
-            console.print(f"          ANTHROPIC_MODEL={status.gateway_model}")
-    if status.api_key_scrubbed:
-        console.print("[yellow]scrubbed[/yellow] ANTHROPIC_API_KEY removed from env "
-                      "(it would have outranked the active auth mode)")
-    if status.auth_token_scrubbed:
-        console.print("[yellow]scrubbed[/yellow] ANTHROPIC_AUTH_TOKEN removed from env "
-                      "(no gateway base URL set — leaving it would outrank subscription)")
-    console.print(f"claude CLI: {status.claude_cli_path} ({status.claude_cli_version})")
+    elif status.auth_mode == "cli_login":
+        console.print("[green]OK[/green] using stored `agent login` session")
+    console.print(f"agent CLI: {status.agent_cli_path} ({status.agent_cli_version})")
 
 
 @main.command("run")
@@ -103,7 +82,8 @@ def auth_check(allow_api_key: bool) -> None:
 @click.option("--run-id", default=None, help="Run identifier (default: random).")
 @click.option("--resume", is_flag=True, help="Resume an existing run-id.")
 @click.option("--max-cost-usd", default=None, type=float,
-              help="Abort if cumulative cost crosses this threshold.")
+              help="(Ignored on the cursor backend — it returns no cost. "
+                   "Use --max-concurrency / --max-recon-tasks instead.)")
 @click.option("--max-concurrency", default=None, type=int,
               help="Cap every stage's concurrency to this (cost containment).")
 @click.option("--max-recon-tasks", default=None, type=int,
@@ -123,8 +103,8 @@ def auth_check(allow_api_key: bool) -> None:
 @click.option("--config", "config_path", default=None, type=click.Path(),
               help="Override config/stages.yaml.")
 @click.option("--allow-api-key", is_flag=True, default=False,
-              help="Honor ANTHROPIC_API_KEY for metered Anthropic billing "
-                   "(also via AUDIT_ALLOW_API_KEY=1).")
+              help="(Deprecated no-op on the cursor backend; the cursor "
+                   "agent always honors CURSOR_API_KEY.)")
 def run(repo: str, run_id: str | None, resume: bool, max_cost_usd: float | None,
         max_concurrency: int | None, max_recon_tasks: int | None,
         target_url: str | None, target_creds: tuple[str, ...],
@@ -138,6 +118,14 @@ def run(repo: str, run_id: str | None, resume: bool, max_cost_usd: float | None,
     except AuthError as e:
         console.print(f"[red]auth error:[/red] {e}")
         sys.exit(2)
+
+    if max_cost_usd is not None:
+        console.print(
+            "[yellow]--max-cost-usd is ignored on the cursor backend "
+            "(no cost is reported); use --max-concurrency / --max-recon-tasks "
+            "for containment[/yellow]"
+        )
+        max_cost_usd = None
 
     config = load_config(Path(config_path)) if config_path else load_config()
     if max_concurrency is not None:

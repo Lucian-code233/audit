@@ -1,47 +1,62 @@
 # Per-stage configuration. Model diversity between Hunt and Validate is
 # load-bearing: it implements the blog's "deliberate disagreement" rule.
-# Trace runs on Opus because the paper calls it "the stage that matters most."
+#
+# cursor backend: models are cursor model names (e.g. composer-2.5,
+# sonnet-4-thinking, gpt-5, or parameterized forms like
+# "claude-opus-4-8[context=1m,effort=high]"). Run `agent --list-models`
+# (while logged in) to see what your account can use.
+#
+# All stages run on composer-2.5. NOTE: this collapses the blog's
+# Hunt-vs-Validate "deliberate disagreement" rule (Validate normally runs a
+# DIFFERENT model than Hunt to adversarially disprove findings). To restore
+# it, point `validate` (and optionally `trace`) at another model your
+# account exposes — confirm names with `agent --list-models`.
+#
+# tools: only Bash is load-bearing on this backend — a stage whose tools
+# include Bash runs the cursor agent in --yolo (full shell); a stage
+# without Bash runs in --mode plan (read-only). Read/Grep/Glob are
+# advisory hints to the model, not enforced.
 
 defaults:
   max_turns: 25
-  permission_mode: acceptEdits   # never bypassPermissions
+  permission_mode: acceptEdits   # advisory only on cursor backend
   repair_attempts: 1             # one re-emit chance on schema-validation failure
 
 stages:
   recon:
-    model: claude-opus-4-7
+    model: composer-2.5
     concurrency: 1
     tools: [Read, Grep, Glob, Bash]
     max_turns: 60                # recon can be long
     repair_attempts: 2           # critical one-shot; spend a second repair turn if needed
   hunt:
-    model: claude-sonnet-4-6
+    model: composer-2.5
     concurrency: 50
     tools: [Read, Grep, Glob, Bash]
   validate:
-    model: claude-opus-4-7        # different from hunt — deliberate disagreement
+    model: composer-2.5           # ideally != hunt for "deliberate disagreement"
     concurrency: 10
-    tools: [Read, Grep, Glob]     # no Bash: pure analysis
+    tools: [Read, Grep, Glob]     # no Bash: pure analysis (runs --mode plan)
   gapfill:
-    model: claude-sonnet-4-6
+    model: composer-2.5
     concurrency: 1
     tools: [Read, Grep, Glob]
     repair_attempts: 2
   dedupe:
-    model: claude-sonnet-4-6
+    model: composer-2.5
     concurrency: 1
     tools: [Read]
   trace:
-    model: claude-opus-4-7        # most critical stage
+    model: composer-2.5           # most critical stage — adversarial reachability proof
     concurrency: 10
     tools: [Read, Grep, Glob, Bash]
   feedback:
-    model: claude-sonnet-4-6
+    model: composer-2.5
     concurrency: 1
     tools: [Read, Grep, Glob]
     repair_attempts: 2
   report:
-    model: claude-sonnet-4-6
+    model: composer-2.5
     concurrency: 1
     tools: [Read]
 
