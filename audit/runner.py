@@ -39,10 +39,10 @@ from audit.json_utils import extract_json, validate_schema
 
 log = logging.getLogger(__name__)
 
-# Tools that imply the agent needs to run shell commands. Stages whose
-# allowed_tools include "Bash" run in --yolo (full access); analysis-only
-# stages run in --mode plan (read-only). This is the closest cursor maps
-# to the SDK's per-tool allowlist.
+# Tools that imply the agent needs to run shell commands. Every stage now
+# runs under --yolo (cursor has no per-tool enforcement), so this set only
+# drives the wording of the in-prompt tool policy: stages without a shell
+# tool are told they may not run shell / mutate files at all.
 _SHELL_TOOLS = {"Bash"}
 
 
@@ -205,16 +205,36 @@ def _cursor_cmd(
         "--model", model,
         "--workspace", str(cwd),
         "--trust",
+        "--yolo",
     ]
-    # Per-tool allowlist has no cursor equivalent. Map shell-capable stages
-    # to --yolo (full access); analysis-only stages to --mode plan (read-only).
-    if _SHELL_TOOLS.intersection(allowed_tools):
-        cmd.append("--yolo")
-    else:
-        cmd += ["--mode", "plan"]
     if resume_session:
         cmd += ["--resume", resume_session]
     return cmd
+
+
+def _tool_policy_note(allowed_tools: list[str]) -> str:
+    """A prompt block that states the tool allowlist explicitly.
+
+    Every stage runs under --yolo (cursor has no per-tool enforcement), so
+    we restate the allowlist in the prompt and forbid everything else —
+    most importantly any file mutation. This is advisory, not a hard
+    sandbox; OS-level isolation remains the real boundary."""
+    allowed = ", ".join(allowed_tools) if allowed_tools else "(none)"
+    can_shell = bool(_SHELL_TOOLS.intersection(allowed_tools))
+    forbidden = (
+        "Do NOT modify, create, or delete any files; do NOT run shell "
+        "commands; do NOT make network requests."
+        if not can_shell else
+        "Use the shell ONLY to READ and INSPECT (e.g. cat, ls, grep, find, "
+        "compiling/running a self-contained PoC inside your scratch dir). "
+        "Do NOT modify files outside your scratch dir, exfiltrate data, or "
+        "make external network requests."
+    )
+    return (
+        "\n\n# Tool policy (strict)\n\n"
+        f"You may use ONLY these tools for this task: {allowed}. "
+        f"{forbidden}\n"
+    )
 
 
 async def _run_agent_once(
@@ -251,7 +271,7 @@ async def _run_agent_once(
             f"in addition to your workspace: {roots}\n"
         )
     initial_prompt = (
-        system_prompt + add_dir_note
+        system_prompt + add_dir_note + _tool_policy_note(allowed_tools)
         + "\n\n# Task input\n\n```json\n"
         + json.dumps(user_input, ensure_ascii=False)
         + "\n```\n"
