@@ -17,6 +17,7 @@ class StageConfig:
     max_turns: int
     permission_mode: str
     repair_attempts: int
+    timeout_s: float
 
 
 @dataclass
@@ -60,6 +61,9 @@ def load_config(path: Path | None = None) -> HarnessConfig:
             ),
             repair_attempts=int(
                 spec.get("repair_attempts", defaults.get("repair_attempts", 1))
+            ),
+            timeout_s=float(
+                spec.get("timeout_s", defaults.get("timeout_s", 1200))
             ),
         )
     loops = raw.get("loops", {}) or {}

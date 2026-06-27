@@ -85,6 +85,7 @@ async def run_hunt(
                     artifact_dir=ctx.results_dir("hunt"),
                     artifact_name=task.task_id,
                     repair_attempts=sc.repair_attempts,
+                    timeout_s=sc.timeout_s,
                 )
             except QuotaExhaustedError:
                 # Subscription quota/session limit hit mid-flight. Don't burn

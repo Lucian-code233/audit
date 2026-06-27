@@ -77,6 +77,14 @@ class QuotaExhaustedError(RuntimeError):
     pipeline and let the user wait for the reset window."""
 
 
+class AgentTimeout(RuntimeError):
+    """The agent subprocess exceeded its wall-clock budget and was killed.
+    Deliberately NOT a TransientAgentError: a hung hunter won't un-hang on
+    retry, so retrying would just burn another full timeout. Propagates to
+    the stage's generic handler, which marks the task 'failed' and moves on
+    — we'd rather drop a stuck task than stall the whole pipeline."""
+
+
 _QUOTA_MARKERS = (
     "out of extra usage",
     "usage limit reached",
@@ -129,6 +137,7 @@ async def run_agent(
     repair_attempts: int = 1,
     transient_retries: int = 3,
     transient_base_delay: float = 30.0,
+    timeout_s: float | None = 1200.0,
 ) -> AgentResult:
     """Run one agent, retrying transient API errors with exponential backoff.
 
@@ -136,7 +145,8 @@ async def run_agent(
     (caller should abort the run). Raises `TransientAgentError` if all
     backoff retries are exhausted. Raises `AgentRunError` if the model
     produced parseable output that doesn't match the schema even after
-    repair turns.
+    repair turns. Raises `AgentTimeout` if a single agent attempt exceeds
+    `timeout_s` wall-clock (the subprocess is killed; not retried).
     """
     last_exc: RuntimeError | None = None
     for attempt in range(transient_retries + 1):
@@ -155,8 +165,12 @@ async def run_agent(
                 artifact_dir=artifact_dir,
                 artifact_name=artifact_name,
                 repair_attempts=repair_attempts,
+                timeout_s=timeout_s,
             )
         except QuotaExhaustedError:
+            raise
+        except AgentTimeout:
+            # A hung subprocess won't recover on retry — fail fast.
             raise
         except TransientAgentError as e:
             last_exc = e
@@ -252,6 +266,7 @@ async def _run_agent_once(
     artifact_dir: Path,
     artifact_name: str,
     repair_attempts: int,
+    timeout_s: float | None = 1200.0,
 ) -> AgentResult:
     """Single attempt. Raises TransientAgentError / QuotaExhaustedError
     before schema validation if the CLI returned an error result."""
@@ -293,6 +308,7 @@ async def _run_agent_once(
                             resume_session=None),
             prompt=initial_prompt,
             art=art,
+            timeout_s=timeout_s,
         )
 
         # Before schema validation: was this a real model response, or did
@@ -322,6 +338,7 @@ async def _run_agent_once(
                                 resume_session=session_id),
                 prompt=repair_prompt,
                 art=art,
+                timeout_s=timeout_s,
             )
             if last_result_msg.get("is_error"):
                 label, exc_cls = _classify_api_error(last_text)
@@ -368,18 +385,27 @@ async def _run_cursor(
     cmd: list[str],
     prompt: str,
     art,
+    timeout_s: float | None = 1200.0,
 ) -> tuple[str, dict[str, Any], str | None]:
     """Spawn the cursor CLI, stream-parse stdout, write each message to the
     JSONL artifact, and return (final assistant text, result_dict, session_id).
 
     Raises TransientAgentError if the process can't be started or dies
-    without producing a result line (treated as retry-worthy)."""
+    without producing a result line (treated as retry-worthy). Raises
+    AgentTimeout if the subprocess produces no result within `timeout_s`
+    wall-clock — the process is killed and the task is failed, not retried."""
     full_cmd = [*cmd, prompt]
     try:
         proc = await asyncio.create_subprocess_exec(
             *full_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            # The cursor CLI emits one JSON object per line. A single line
+            # (assistant message / result with large diffs or file contents)
+            # routinely exceeds asyncio's default 64 KiB StreamReader buffer,
+            # which makes `async for raw in proc.stdout` raise LimitOverrunError
+            # ("Separator is/ is not found, ... chunk ... limit"). Bump to 32 MiB.
+            limit=32 * 1024 * 1024,
         )
     except (OSError, ValueError) as e:
         raise TransientAgentError(
@@ -392,59 +418,98 @@ async def _run_cursor(
     session_id: str | None = None
     saw_result = False
 
-    assert proc.stdout is not None
-    async for raw in proc.stdout:
-        line = raw.decode("utf-8", "replace").strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            # Non-JSON noise on stdout (e.g. an auth/usage error printed
-            # outside the stream). Capture it so the error classifier and
-            # artifact have something to work with.
-            _write_artifact(art, {"kind": "stdout_nonjson", "text": line[:2000]})
-            if not result_msg:
-                result_msg = {"is_error": True, "result": line}
+    async def _consume() -> tuple[str, dict[str, Any], str | None]:
+        nonlocal last_assistant_text, result_msg, session_id, saw_result
+        assert proc.stdout is not None
+        async for raw in proc.stdout:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                # Non-JSON noise on stdout (e.g. an auth/usage error printed
+                # outside the stream). Capture it so the error classifier and
+                # artifact have something to work with.
+                _write_artifact(art, {"kind": "stdout_nonjson", "text": line[:2000]})
+                if not result_msg:
+                    result_msg = {"is_error": True, "result": line}
+                    saw_result = True
+                continue
+
+            norm = _normalize_cursor_msg(obj)
+            if norm is not None:
+                _write_artifact(art, norm)
+
+            sid = obj.get("session_id")
+            if sid:
+                session_id = sid
+
+            mtype = obj.get("type")
+            if mtype == "thinking" and obj.get("subtype") == "delta":
+                thinking_buf.append(obj.get("text", ""))
+            elif mtype == "thinking" and obj.get("subtype") == "completed":
+                # Flush the buffered reasoning as one artifact line. cursor
+                # streams thinking as deltas with the full text only
+                # reconstructable by concatenation; without this the trace
+                # loses the model's reasoning entirely.
+                text = "".join(thinking_buf)
+                thinking_buf.clear()
+                if text:
+                    _write_artifact(art, {"kind": "thinking", "text": text})
+            elif mtype == "assistant":
+                text = _assistant_text(obj)
+                if text:
+                    last_assistant_text = text
+            elif mtype == "result":
+                result_msg = _result_to_dict(obj)
                 saw_result = True
-            continue
 
-        norm = _normalize_cursor_msg(obj)
-        if norm is not None:
-            _write_artifact(art, norm)
+        stderr_bytes = await proc.stderr.read() if proc.stderr else b""
+        await proc.wait()
+        stderr_text = stderr_bytes.decode("utf-8", "replace").strip()
 
-        sid = obj.get("session_id")
-        if sid:
-            session_id = sid
+        if not saw_result:
+            # No result line at all → treat the process exit + stderr as the
+            # error surface, classified downstream.
+            msg = stderr_text or f"cursor agent exited {proc.returncode} with no result"
+            _write_artifact(art, {"kind": "no_result", "returncode": proc.returncode,
+                                  "stderr": stderr_text[:2000]})
+            result_msg = {"is_error": True, "result": msg}
+            return msg, result_msg, session_id
 
-        mtype = obj.get("type")
-        if mtype == "thinking" and obj.get("subtype") == "delta":
-            thinking_buf.append(obj.get("text", ""))
-        elif mtype == "assistant":
-            text = _assistant_text(obj)
-            if text:
-                last_assistant_text = text
-        elif mtype == "result":
-            result_msg = _result_to_dict(obj)
-            saw_result = True
+        # Prefer the result line's full text (== final assistant message);
+        # fall back to the last streamed assistant block.
+        final_text = result_msg.get("result") or last_assistant_text
+        return final_text, result_msg, session_id
 
-    stderr_bytes = await proc.stderr.read() if proc.stderr else b""
-    await proc.wait()
-    stderr_text = stderr_bytes.decode("utf-8", "replace").strip()
+    try:
+        return await asyncio.wait_for(_consume(), timeout=timeout_s)
+    except (asyncio.TimeoutError, TimeoutError):
+        # The agent hung (stuck PoC, dead network read, infinite loop). Kill
+        # the subprocess so it can't leak as an orphan, then fail the task.
+        await _kill_proc(proc)
+        _write_artifact(art, {"kind": "timeout", "timeout_s": timeout_s,
+                              "pid": proc.pid})
+        raise AgentTimeout(
+            f"[{stage}/{artifact_name}] agent exceeded {timeout_s:.0f}s "
+            f"wall-clock budget — killed pid {proc.pid}"
+        )
 
-    if not saw_result:
-        # No result line at all → treat the process exit + stderr as the
-        # error surface, classified downstream.
-        msg = stderr_text or f"cursor agent exited {proc.returncode} with no result"
-        _write_artifact(art, {"kind": "no_result", "returncode": proc.returncode,
-                              "stderr": stderr_text[:2000]})
-        result_msg = {"is_error": True, "result": msg}
-        return msg, result_msg, session_id
 
-    # Prefer the result line's full text (== final assistant message);
-    # fall back to the last streamed assistant block.
-    final_text = result_msg.get("result") or last_assistant_text
-    return final_text, result_msg, session_id
+async def _kill_proc(proc: asyncio.subprocess.Process) -> None:
+    """Best-effort terminate→kill of a subprocess and reap it, so a hung
+    agent never lingers as an orphan holding scratch files / sockets."""
+    if proc.returncode is not None:
+        return
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        return
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=10.0)
+    except (asyncio.TimeoutError, TimeoutError):
+        log.warning("subprocess pid %s did not exit after kill", proc.pid)
 
 
 def _assistant_text(obj: dict[str, Any]) -> str:
@@ -466,9 +531,9 @@ def _normalize_cursor_msg(obj: dict[str, Any]) -> dict[str, Any] | None:
         return {"kind": "system_init", "model": obj.get("model"),
                 "cwd": obj.get("cwd"), "permission_mode": obj.get("permissionMode")}
     if mtype == "thinking":
-        if sub == "completed":
-            return {"kind": "thinking_completed"}
-        return None  # deltas buffered, not written per-line
+        # Thinking is handled statefully in _consume: deltas are buffered
+        # and flushed as one {"kind":"thinking"} line on `completed`.
+        return None
     if mtype == "assistant":
         return {"kind": "assistant", "content": [{"type": "text",
                 "text": _assistant_text(obj)}]}

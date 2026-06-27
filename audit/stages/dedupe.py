@@ -41,6 +41,7 @@ async def run_dedupe(ctx: StageContext, db: StateDB) -> int:
             artifact_dir=ctx.results_dir("dedupe"),
             artifact_name="dedupe",
             repair_attempts=sc.repair_attempts,
+            timeout_s=sc.timeout_s,
         )
     except (AgentRunError, TransientAgentError) as e:
         log.warning("[%s] dedupe failed: %s — treating each finding as its own group",

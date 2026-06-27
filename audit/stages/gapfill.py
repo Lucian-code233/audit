@@ -69,6 +69,7 @@ async def run_gapfill(ctx: StageContext, db: StateDB,
             artifact_dir=ctx.results_dir("gapfill"),
             artifact_name=f"gapfill_{_iter_tag(ctx.run_id, db)}",
             repair_attempts=sc.repair_attempts,
+            timeout_s=sc.timeout_s,
         )
     except (AgentRunError, TransientAgentError) as e:
         log.warning("[%s] gapfill failed: %s — skipping iteration", ctx.run_id, e)

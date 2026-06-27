@@ -21,6 +21,10 @@ defaults:
   max_turns: 25
   permission_mode: acceptEdits   # advisory only on cursor backend
   repair_attempts: 1             # one re-emit chance on schema-validation failure
+  timeout_s: 3600                # per-agent wall-clock cap; a hung agent is
+                                 # killed + task marked failed (normal hunt
+                                 # max observed ~520s; 3600s = 1h gives heavy
+                                 # race/logic_chain tasks ample room)
 
 stages:
   recon:
@@ -28,6 +32,7 @@ stages:
     concurrency: 1
     tools: [Read, Grep, Glob, Bash]
     max_turns: 60                # recon can be long
+    timeout_s: 5400              # recon legitimately runs longest (max_turns 60)
     repair_attempts: 2           # critical one-shot; spend a second repair turn if needed
   hunt:
     model: composer-2.5

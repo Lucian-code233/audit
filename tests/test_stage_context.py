@@ -12,7 +12,8 @@ from audit.stages._common import StageContext
 def _ctx(**kwargs) -> StageContext:
     cfg = HarnessConfig(stages={"hunt": StageConfig(
         name="hunt", model="x", concurrency=1, tools=["Read"],
-        max_turns=10, permission_mode="default", repair_attempts=0)})
+        max_turns=10, permission_mode="default", repair_attempts=0,
+        timeout_s=1200)})
     return StageContext(run_id="r", repo_path=Path("/tmp"), config=cfg, **kwargs)
 
 
